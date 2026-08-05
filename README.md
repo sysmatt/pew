@@ -4,6 +4,8 @@ Run a command, push a file, or diff a file across a set of systems —
 using your existing Ansible inventory as the source of truth for what
 those systems are.
 
+If you want to pew pew your foot off, pew is the tool for you!
+
 `pew` is a from-scratch, modern rewrite of the ideas in an old internal
 Perl tool called `mew` (1998–2001), which did the same job by reading a
 hand-maintained `.mewrc` file of hosts and groups. `pew` drops that
