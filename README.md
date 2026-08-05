@@ -1,6 +1,6 @@
 # pew
 
-Run a command, push a file, or diff a file across a set of systems —
+Run a command, push a file, or diff a file (optionally in parallel) across a set of systems —
 using your existing Ansible inventory as the source of truth for what
 those systems are.
 
