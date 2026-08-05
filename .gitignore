@@ -1,3 +1,4 @@
+worklist.txt
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -31,6 +32,7 @@ MANIFEST
 #   before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+hamdat.py
 
 # Installer logs
 pip-log.txt
@@ -216,3 +218,4 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.claude
