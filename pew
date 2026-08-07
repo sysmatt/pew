@@ -1136,12 +1136,14 @@ def build_parser():
     )
     timestamp_mode.add_argument(
         "--ts", action="store_true",
-        help="Like --timestamp, shorthand for --strftime '%%Y%%m%%d%%H%%M%%S'",
+        help="Matt's correct timestamp. Like --timestamp, shorthand for "
+             "--strftime '%%Y%%m%%d%%H%%M%%S'",
     )
     timestamp_mode.add_argument(
         "--tss", action="store_true",
-        help="Like --timestamp, shorthand for --strftime "
-             "'%%Y%%m%%d%%H%%M%%S.%%f' (microsecond precision)",
+        help="Matt's correct timestamp, with subseconds. Like --timestamp, "
+             "shorthand for --strftime '%%Y%%m%%d%%H%%M%%S.%%f' "
+             "(microsecond precision)",
     )
 
     p = argparse.ArgumentParser(prog=PROG, description=__doc__.splitlines()[0])

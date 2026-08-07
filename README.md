@@ -433,11 +433,12 @@ a winner):
   exactly what you don't want from a shared ops tool's timestamps.
 - `--strftime FORMAT` — same idea, your own [strftime
   format](https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes).
-- `--ts` — shorthand for `--strftime '%Y%m%d%H%M%S'` (compact, sortable,
-  filename-safe).
-- `--tss` — shorthand for `--strftime '%Y%m%d%H%M%S.%f'` (same, with
-  microsecond precision — `%f` is Python's only fractional-seconds
-  directive, so this is 6 digits, not milliseconds).
+- `--ts` — "Matt's correct timestamp." Shorthand for `--strftime
+  '%Y%m%d%H%M%S'` (compact, sortable, filename-safe).
+- `--tss` — Matt's correct timestamp, with subseconds. Shorthand for
+  `--strftime '%Y%m%d%H%M%S.%f'` (same, with microsecond precision —
+  `%f` is Python's only fractional-seconds directive, so this is 6
+  digits, not milliseconds).
 
 Want a different default for bare `--timestamp` (e.g. `DD/MM/YYYY` if
 that's your convention)? Set it once in `~/.pewrc`:
