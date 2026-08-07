@@ -371,8 +371,91 @@ pew run --hosts webservers --yes --quiet -- hostname
 
 `--parallel` always runs without prompting (there's no meaningful way to
 ask "run on this host?" one at a time when they're all launched at
-once) — output is buffered per host and printed as each one finishes,
-so lines from different hosts never get interleaved mid-line.
+once) — by default, output is buffered per host and printed as each one
+finishes, so lines from different hosts never get interleaved mid-line.
+
+#### `--follow` — stream output live instead of waiting
+
+```sh
+pew run --hosts webservers --yes --follow -- some-slow-command
+pew run --hosts webservers --yes --parallel --follow -- tail -n0 -f /var/log/app.log
+```
+
+By default `pew run` captures a host's *entire* output and only shows
+it once that host's command has finished. `--follow`/`-f` instead
+prints each line as it's produced — same name as `tail -f`/`docker
+compose logs -f`/`kubectl logs -f`, and it means the same thing here.
+It's independent of `--parallel`: serial `--follow` still confirms and
+runs one host at a time, you just see that host's output live instead
+of in silence until it completes; `--parallel --follow` streams every
+host's output live and genuinely interleaved (like `docker compose logs
+-f` across multiple services). The one thing it can't combine with is
+`--multiline`, which needs the complete buffered output up front to
+print its banner-then-block — `pew` will refuse that combination
+outright rather than guess what you meant.
+
+**The best part of this pairing**: combine `--follow` with
+`--log-prefix`, and each `PREFIX.hostname` file is written to
+line-by-line, flushed immediately, *as the command runs* — not just
+written once at the end. That means you can genuinely `tail -f
+PREFIX.hostname` in another terminal and watch a specific host's
+progress in real time, even in the middle of a `--parallel` run across
+dozens of hosts:
+
+```sh
+pew run --hosts webservers --yes --parallel --follow --log-prefix /tmp/rollout -- ./deploy.sh
+# in another terminal:
+tail -f /tmp/rollout.web3
+```
+
+#### Timestamps
+
+Available on `run` and `copy` (the two subcommands with real output to
+timestamp — `list`/`diff`/`facts` don't have this option). Most useful
+with `--follow`/`--parallel`, where knowing exactly *when* a line showed
+up is otherwise easy to lose track of, but it's harmless and available
+across the board:
+
+```sh
+pew run --hosts webservers --yes --timestamp -- some-command
+pew run --hosts webservers --yes --parallel --follow --ts -- some-command
+```
+
+Four mutually exclusive options (pick one — combining them is
+ambiguous, so `pew` rejects that outright rather than silently picking
+a winner):
+
+- `--timestamp`/`-t` — prefixes each line with `2026-08-07 14:23:01`
+  (`%Y-%m-%d %H:%M:%S`) by default. Full date and time, sortable as
+  plain text, deliberately locale-independent — *not* `%c` ("locale's
+  appropriate representation"), which would silently format differently
+  depending on whoever's `$LC_TIME` happens to be set to, which is
+  exactly what you don't want from a shared ops tool's timestamps.
+- `--strftime FORMAT` — same idea, your own [strftime
+  format](https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes).
+- `--ts` — shorthand for `--strftime '%Y%m%d%H%M%S'` (compact, sortable,
+  filename-safe).
+- `--tss` — shorthand for `--strftime '%Y%m%d%H%M%S.%f'` (same, with
+  microsecond precision — `%f` is Python's only fractional-seconds
+  directive, so this is 6 digits, not milliseconds).
+
+Want a different default for bare `--timestamp` (e.g. `DD/MM/YYYY` if
+that's your convention)? Set it once in `~/.pewrc`:
+
+```sh
+cat >> ~/.pewrc <<'EOF'
+timestamp_format=%d/%m/%Y %H:%M:%S
+EOF
+```
+
+`--strftime`/`--ts`/`--tss` still override this when given explicitly —
+`timestamp_format=` only changes what bare `--timestamp` defaults to.
+
+**Timestamps are terminal-only.** They're never written into
+`--log-prefix` files, which stay exactly as clean as they'd be without
+`--timestamp` — the whole point of a plain per-host log file is that it
+reads as if you'd run the command directly on that host, and timestamp
+noise on every line works against that.
 
 ### `pew copy` — push file(s) to each host
 
@@ -492,10 +575,10 @@ web1: rsync app.conf web1:/etc/app/app.conf
 web1: ssh web1 'chown deploy:deploy /etc/app/app.conf; chmod 640 /etc/app/app.conf'
 ```
 
-`--parallel`, `--jobs`, `--continue-on-fail`, and `--log-prefix` have
-nothing to do during a dry run and are silently ignored — hosts are
-always previewed serially, in order, and nothing is written to a log
-file.
+`--parallel`, `--jobs`, `--continue-on-fail`, `--log-prefix`, and
+`--follow` have nothing to do during a dry run and are silently ignored
+— hosts are always previewed serially, in order, and nothing is written
+to a log file.
 
 ## Confirm loop
 

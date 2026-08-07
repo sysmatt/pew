@@ -11,16 +11,19 @@ Spiritual successor to the old Perl "mew" tool. Not flag-compatible with it.
 
 import argparse
 import concurrent.futures
+import datetime
 import grp
 import json
 import os
 import pwd
+import queue
 import re
 import shlex
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 
 PROG = "pew"
 
@@ -176,6 +179,14 @@ def parse_regex(value):
         re.compile(value)
     except re.error as e:
         raise argparse.ArgumentTypeError(f"invalid regex {value!r}: {e}")
+    return value
+
+
+def parse_strftime(value):
+    try:
+        datetime.datetime.now().strftime(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"invalid --strftime format {value!r}: {e}")
     return value
 
 
@@ -547,30 +558,180 @@ def run_host(host, args, opts):
         return 127, "", "ssh not found on PATH"
 
 
-def emit(host, output, quiet, multiline, log_prefix, width=0):
+def run_host_streaming(host, args, opts, on_line):
+    """Like run_host, but calls on_line(line) for each line of output as it
+    arrives instead of buffering and returning it all at once. Returns
+    (rc, note), same shape as run_host's last two return values.
+
+    Timeout is enforced with a threading.Timer that kills the process if it
+    fires — not subprocess.run(timeout=...), which doesn't apply here since
+    we're reading incrementally. Killing the process closes its end of the
+    pipe, which ends the `for line in proc.stdout` loop naturally even if
+    the command was still silent (never having produced a line at all).
+    """
+    argv = ["ssh", remote_spec(host, opts)] + substitute(args, host)
+    debug_cmd(argv)
+    try:
+        proc = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+    except FileNotFoundError:
+        return 127, "ssh not found on PATH"
+
+    timed_out = False
+    timer = None
+    if opts.timeout:
+        def _kill():
+            nonlocal timed_out
+            timed_out = True
+            proc.kill()
+        timer = threading.Timer(opts.timeout, _kill)
+        timer.start()
+
+    for line in proc.stdout:
+        on_line(line.rstrip("\n"))
+    rc = proc.wait()
+
+    if timer:
+        timer.cancel()
+    if timed_out:
+        return 124, f"timed out after {opts.timeout}s"
+    return rc, None
+
+
+DEFAULT_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def effective_timestamp_format(opts):
+    """--strftime > --ts > --tss > --timestamp (using ~/.pewrc's
+    timestamp_format= if set, else DEFAULT_TIMESTAMP_FORMAT) > no
+    timestamp at all. The four flags are mutually exclusive at the
+    argparse level, so at most one of them is ever actually set."""
+    if getattr(opts, "strftime", None):
+        return opts.strftime
+    if getattr(opts, "ts", False):
+        return "%Y%m%d%H%M%S"
+    if getattr(opts, "tss", False):
+        return "%Y%m%d%H%M%S.%f"
+    if getattr(opts, "timestamp", False):
+        return load_pewrc().get("timestamp_format") or DEFAULT_TIMESTAMP_FORMAT
+    return None
+
+
+def timestamp_prefix(opts):
+    """Terminal-only — never written into --log-prefix files, which stay
+    clean on purpose."""
+    fmt = effective_timestamp_format(opts)
+    return datetime.datetime.now().strftime(fmt) + " " if fmt else ""
+
+
+def emit_line(host, line, quiet, width, opts=None):
+    ts = timestamp_prefix(opts)
+    print(f"{ts}{line}" if quiet else f"{ts}{host:<{width}}: {line}")
+
+
+def open_log(log_prefix, host):
+    # buffering=1 (line-buffered) so --log-prefix files are flushed on every
+    # line, not just on close — the whole point of pairing this with
+    # --follow is that `tail -f PREFIX.hostname` works while it's running.
+    return open(f"{log_prefix}.{host}", "a", buffering=1) if log_prefix else None
+
+
+def do_run_follow_serial(hosts, args, opts, width):
+    failures = []
+    state = {"yes_all": opts.yes}
+    for host in hosts:
+        desc = run_cmdline(host, args, opts)
+        if not confirm(host, desc, state, width):
+            print(f"*** {host}: SKIPPED ***")
+            continue
+        log_f = open_log(opts.log_prefix, host)
+
+        def on_line(line):
+            emit_line(host, line, opts.quiet, width, opts)
+            if log_f:
+                log_f.write(line + "\n")
+
+        rc, note = run_host_streaming(host, args, opts, on_line)
+        if log_f:
+            log_f.close()
+        if rc != 0:
+            failures.append(host)
+            extra = f" ({note})" if note else ""
+            warn(f"{host} returned {rc}{extra}")
+            if not opts.continue_on_fail:
+                warn("stopping (pass --continue-on-fail/-X to proceed past failures)")
+                break
+    return failures
+
+
+def do_run_follow_parallel(hosts, args, opts, width):
+    q = queue.Queue()
+    DONE = object()
+    log_files = {h: open_log(opts.log_prefix, h) for h in hosts}
+
+    def worker(host):
+        def on_line(line):
+            q.put((host, line))
+        rc, note = run_host_streaming(host, args, opts, on_line)
+        q.put((host, DONE))
+        return rc, note
+
+    failures = []
+    max_workers = opts.jobs if opts.jobs else len(hosts)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_to_host = {ex.submit(worker, h): h for h in hosts}
+        remaining = len(hosts)
+        while remaining > 0:
+            host, item = q.get()
+            if item is DONE:
+                remaining -= 1
+                continue
+            emit_line(host, item, opts.quiet, width, opts)
+            if log_files[host]:
+                log_files[host].write(item + "\n")
+
+        for fut in concurrent.futures.as_completed(future_to_host):
+            host = future_to_host[fut]
+            rc, note = fut.result()
+            if rc != 0:
+                failures.append(host)
+                extra = f" ({note})" if note else ""
+                warn(f"{host} returned {rc}{extra}")
+
+    for f in log_files.values():
+        if f:
+            f.close()
+    return failures
+
+
+def emit(host, output, quiet, multiline, log_prefix, width=0, opts=None):
+    # Log files stay clean on purpose — timestamps (if any) are terminal-only.
     if log_prefix:
         with open(f"{log_prefix}.{host}", "a") as f:
             f.write(output)
             if output and not output.endswith("\n"):
                 f.write("\n")
 
+    ts = timestamp_prefix(opts)
+
     if quiet:
-        if output:
-            sys.stdout.write(output if output.endswith("\n") else output + "\n")
+        for line in output.splitlines():
+            print(f"{ts}{line}")
         return
 
     if multiline:
-        print(f"### {host.upper()} ###")
-        if output:
-            sys.stdout.write(output if output.endswith("\n") else output + "\n")
+        print(f"{ts}### {host.upper()} ###")
+        for line in output.splitlines():
+            print(f"{ts}{line}")
         return
 
     prefix = f"{host:<{width}}: "
     lines = output.splitlines()
     if not lines:
-        print(prefix)
+        print(f"{ts}{prefix}")
     for line in lines:
-        print(f"{prefix}{line}")
+        print(f"{ts}{prefix}{line}")
 
 
 def run_cmdline(host, args, opts):
@@ -582,8 +743,13 @@ def do_run(hosts, args, opts):
 
     if opts.dry_run:
         for host in hosts:
-            emit(host, run_cmdline(host, args, opts), opts.quiet, opts.multiline, None, width)
+            emit(host, run_cmdline(host, args, opts), opts.quiet, opts.multiline, None, width, opts)
         return []
+
+    if opts.follow:
+        if opts.parallel:
+            return do_run_follow_parallel(hosts, args, opts, width)
+        return do_run_follow_serial(hosts, args, opts, width)
 
     failures = []
 
@@ -596,7 +762,7 @@ def do_run(hosts, args, opts):
             for fut in concurrent.futures.as_completed(future_to_host):
                 host = future_to_host[fut]
                 rc, output, note = fut.result()
-                emit(host, output, opts.quiet, opts.multiline, opts.log_prefix, width)
+                emit(host, output, opts.quiet, opts.multiline, opts.log_prefix, width, opts)
                 if rc != 0:
                     failures.append(host)
                     extra = f" ({note})" if note else ""
@@ -610,7 +776,7 @@ def do_run(hosts, args, opts):
             print(f"*** {host}: SKIPPED ***")
             continue
         rc, output, note = run_host(host, args, opts)
-        emit(host, output, opts.quiet, opts.multiline, opts.log_prefix, width)
+        emit(host, output, opts.quiet, opts.multiline, opts.log_prefix, width, opts)
         if rc != 0:
             failures.append(host)
             extra = f" ({note})" if note else ""
@@ -740,7 +906,7 @@ def do_copy(hosts, targets, opts):
 
     if opts.dry_run:
         for host in hosts:
-            emit(host, plan_copy(host, targets, opts), opts.quiet, False, None, width)
+            emit(host, plan_copy(host, targets, opts), opts.quiet, False, None, width, opts)
         return []
 
     failures = []
@@ -750,7 +916,7 @@ def do_copy(hosts, targets, opts):
         # which case output holds its real transfer log. Otherwise fall
         # back to a plain confirmation line so success isn't totally mute.
         text = output if output.strip() else f"copied {copy_description(host, targets, opts)}"
-        emit(host, text, opts.quiet, False, opts.log_prefix, width)
+        emit(host, text, opts.quiet, False, opts.log_prefix, width, opts)
 
     if opts.parallel:
         max_workers = opts.jobs if opts.jobs else len(hosts)
@@ -956,15 +1122,46 @@ def build_parser():
         "--log-prefix", "-y", metavar="PREFIX",
         help="Also write each host's output to PREFIX.hostname",
     )
+    timestamp_mode = exec_parent.add_mutually_exclusive_group()
+    timestamp_mode.add_argument(
+        "--timestamp", "-t", action="store_true",
+        help="Prefix each terminal line with a timestamp "
+             f"({repr(DEFAULT_TIMESTAMP_FORMAT).replace('%', '%%')}, or "
+             "~/.pewrc's timestamp_format= if set). Never written to "
+             "--log-prefix files, which stay clean.",
+    )
+    timestamp_mode.add_argument(
+        "--strftime", type=parse_strftime, metavar="FORMAT",
+        help="Like --timestamp, with a custom strftime format",
+    )
+    timestamp_mode.add_argument(
+        "--ts", action="store_true",
+        help="Like --timestamp, shorthand for --strftime '%%Y%%m%%d%%H%%M%%S'",
+    )
+    timestamp_mode.add_argument(
+        "--tss", action="store_true",
+        help="Like --timestamp, shorthand for --strftime "
+             "'%%Y%%m%%d%%H%%M%%S.%%f' (microsecond precision)",
+    )
 
     p = argparse.ArgumentParser(prog=PROG, description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="action", required=True)
 
     run_p = sub.add_parser("run", parents=[exec_parent],
                             help="Run a command on each host")
-    run_p.add_argument(
+    output_mode = run_p.add_mutually_exclusive_group()
+    output_mode.add_argument(
         "--multiline", "-m", action="store_true",
         help="Print a '### HOST ###' banner then output, instead of prefixing every line",
+    )
+    output_mode.add_argument(
+        "--follow", "-f", action="store_true",
+        help="Stream output line by line as it's produced, instead of waiting "
+             "for each host to finish. Independent of --parallel — works "
+             "serially too. Can't combine with --multiline, which needs the "
+             "full buffered output to print its banner-then-block. If "
+             "--log-prefix is also set, PREFIX.hostname is appended to live "
+             "as well, so `tail -f` on it works while the host is still running.",
     )
     run_p.add_argument(
         "command", nargs=argparse.REMAINDER,
