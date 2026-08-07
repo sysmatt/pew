@@ -1,0 +1,26 @@
+services:
+  ubuntu:
+    build:
+      context: ./containers
+      dockerfile: ubuntu/Dockerfile
+    container_name: pew-test-ubuntu
+    hostname: test-ubuntu
+    ports:
+      - "127.0.0.1:2201:22"
+    volumes:
+      - ./ssh/id_test.pub:/run/test-pubkey/id_test.pub:ro
+      - ./logs/ubuntu:/var/log/test-harness
+    restart: unless-stopped
+
+  rocky:
+    build:
+      context: ./containers
+      dockerfile: rocky/Dockerfile
+    container_name: pew-test-rocky
+    hostname: test-rocky
+    ports:
+      - "127.0.0.1:2203:22"
+    volumes:
+      - ./ssh/id_test.pub:/run/test-pubkey/id_test.pub:ro
+      - ./logs/rocky:/var/log/test-harness
+    restart: unless-stopped

@@ -12,8 +12,10 @@ Spiritual successor to the old Perl "mew" tool. Not flag-compatible with it.
 import argparse
 import concurrent.futures
 import grp
+import json
 import os
 import pwd
+import re
 import shlex
 import stat
 import subprocess
@@ -30,6 +32,43 @@ def die(msg, code=1):
 
 def warn(msg):
     print(f"{PROG}: warning: {msg}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Verbose/debug logging. Plain module globals (set once in main()) rather
+# than threading opts through every function, matching the original mew's
+# own $DEBUG global.
+# ---------------------------------------------------------------------------
+
+VERBOSE = False
+DEBUG = False
+
+
+def info(msg):
+    if VERBOSE or DEBUG:
+        print(f"{PROG}: {msg}", file=sys.stderr)
+
+
+def debug(msg):
+    if DEBUG:
+        print(f"{PROG}: debug: {msg}", file=sys.stderr)
+
+
+def debug_cmd(cmd):
+    if DEBUG:
+        print(f"{PROG}: debug: + {shlex.join(cmd)}", file=sys.stderr)
+
+
+def debug_json(label, data):
+    if DEBUG:
+        print(f"{PROG}: debug: {label}:", file=sys.stderr)
+        print(json.dumps(data, indent=2, sort_keys=True), file=sys.stderr)
+
+
+def debug_block(label, text):
+    if DEBUG and text and text.strip():
+        print(f"{PROG}: debug: {label}:", file=sys.stderr)
+        print(text.rstrip(), file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -60,17 +99,50 @@ def load_pewrc():
 def determine_inventory(cli_inventory):
     """--inventory flag > $PEW_INVENTORY > ~/.pewrc [inventory=] > let ansible decide."""
     if cli_inventory:
+        debug(f"inventory from --inventory: {cli_inventory}")
         return cli_inventory
     if os.environ.get("PEW_INVENTORY"):
+        debug(f"inventory from $PEW_INVENTORY: {os.environ['PEW_INVENTORY']}")
         return os.environ["PEW_INVENTORY"]
-    return load_pewrc().get("inventory")
+    from_rc = load_pewrc().get("inventory")
+    if from_rc:
+        debug(f"inventory from {PEWRC_PATH}: {from_rc}")
+    else:
+        debug("no inventory override found; letting ansible resolve its own default")
+    return from_rc
+
+
+def apply_ansible_config():
+    """Export $ANSIBLE_CONFIG from ~/.pewrc's ansible_config=, if set and not
+    already present in the environment.
+
+    Unlike inventory, this isn't a per-call argument — ansible.cfg carries
+    settings pew has no other way to pass through (vault_password_file,
+    roles_path, callback config, etc.), and Ansible only auto-discovers
+    ./ansible.cfg relative to the *current directory*, not pew's own
+    location or the target inventory's. An explicit environment variable
+    already set by the caller always wins over ~/.pewrc.
+    """
+    if os.environ.get("ANSIBLE_CONFIG"):
+        debug(f"ANSIBLE_CONFIG already set in environment: {os.environ['ANSIBLE_CONFIG']}")
+        return
+    config_path = load_pewrc().get("ansible_config")
+    if not config_path:
+        return
+    if not os.path.isfile(config_path):
+        warn(f"ansible_config in {PEWRC_PATH} does not exist: {config_path}")
+    debug(f"ANSIBLE_CONFIG from {PEWRC_PATH}: {config_path}")
+    os.environ["ANSIBLE_CONFIG"] = config_path
 
 
 def resolve_hosts(pattern, inventory=None, sort=False):
     inventory = determine_inventory(inventory)
+    info(f"resolving hosts for pattern {pattern!r}"
+         + (f" (inventory: {inventory})" if inventory else ""))
     cmd = ["ansible", pattern, "--list-hosts"]
     if inventory:
         cmd += ["-i", inventory]
+    debug_cmd(cmd)
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
@@ -86,7 +158,299 @@ def resolve_hosts(pattern, inventory=None, sort=False):
     ]
     if not hosts:
         die(f"host pattern {pattern!r} matched no hosts")
-    return sorted(hosts) if sort else hosts
+    hosts = sorted(hosts) if sort else hosts
+    info(f"resolved {len(hosts)} host(s)")
+    debug(f"host list: {', '.join(hosts)}")
+    return hosts
+
+
+# ---------------------------------------------------------------------------
+# Fact-based filtering (--where)
+# ---------------------------------------------------------------------------
+
+WHERE_OPERATOR_RE = re.compile(r"^(.*?)(!=|<=|>=|~=|<|>|=)(.*)$")
+
+
+def parse_regex(value):
+    try:
+        re.compile(value)
+    except re.error as e:
+        raise argparse.ArgumentTypeError(f"invalid regex {value!r}: {e}")
+    return value
+
+
+def parse_where(value):
+    m = WHERE_OPERATOR_RE.match(value)
+    if not m:
+        raise argparse.ArgumentTypeError(
+            f"--where must be KEY<op>VALUE (one of = != < > <= >= ~=), got {value!r}"
+        )
+    key, op, val = m.group(1).strip(), m.group(2), m.group(3).strip()
+    if op == "~=":
+        parse_regex(val)
+    return key, op, val
+
+
+def compare_one(op, actual, expected):
+    a = str(actual)
+    if op == "=":
+        return a == expected
+    if op == "~=":
+        return re.search(expected, a) is not None
+    try:
+        lhs, rhs = float(a), float(expected)
+    except ValueError:
+        lhs, rhs = a, expected
+    if op == "<":
+        return lhs < rhs
+    if op == ">":
+        return lhs > rhs
+    if op == "<=":
+        return lhs <= rhs
+    if op == ">=":
+        return lhs >= rhs
+    raise AssertionError(f"unhandled --where operator {op!r}")
+
+
+def where_matches(merged, segments, op, expected):
+    resolved = list(resolve_path(merged, segments))
+    if op == "!=":
+        # Negation of "=", not "flip the operator": a [] list path only
+        # satisfies != if NONE of its elements equal the value (including
+        # when the path resolves to nothing at all — a missing key can't
+        # equal anything, so it trivially satisfies !=).
+        return not any(compare_one("=", v, expected) for v in resolved)
+    return any(compare_one(op, v, expected) for v in resolved)
+
+
+# A --where path is dotted keys with optional [] ("any element of this
+# list") or [N] (a specific index): ansible_mounts[].mount,
+# ansible_default_ipv4.address, ansible_mounts[0].fstype. Splits on '.' and
+# on bracket groups; bare dots between segments just fall out of the match.
+PATH_SEGMENT_RE = re.compile(r"[^.\[\]]+|\[\d*\]")
+
+
+def parse_path(path):
+    return PATH_SEGMENT_RE.findall(path)
+
+
+def resolve_path(data, segments):
+    """Yields every value `segments` reaches by walking `data`. A plain
+    dotted path with no [] yields at most one value (or none, if any
+    segment is missing) — same behavior as a flat dict.get() lookup."""
+    if not segments:
+        yield data
+        return
+    seg, rest = segments[0], segments[1:]
+    if seg == "[]":
+        if isinstance(data, list):
+            for item in data:
+                yield from resolve_path(item, rest)
+        return
+    if seg.startswith("[") and seg.endswith("]"):
+        try:
+            idx = int(seg[1:-1])
+        except ValueError:
+            return
+        if isinstance(data, list) and -len(data) <= idx < len(data):
+            yield from resolve_path(data[idx], rest)
+        return
+    if isinstance(data, dict) and seg in data:
+        yield from resolve_path(data[seg], rest)
+
+
+def flatten(data, prefix=""):
+    """Inverse of resolve_path: walks a nested dict/list and yields every
+    leaf as (path, value), using the exact same dotted/bracket syntax
+    parse_path()/resolve_path() expect — so a path shown by `pew facts` is
+    directly usable as a --where KEY."""
+    if isinstance(data, dict):
+        for k, v in data.items():
+            yield from flatten(v, f"{prefix}.{k}" if prefix else k)
+    elif isinstance(data, list):
+        for i, v in enumerate(data):
+            yield from flatten(v, f"{prefix}[{i}]")
+    else:
+        yield prefix, data
+
+
+# Matches ansible ad-hoc's *default* result marker (no special flag or
+# stdout callback needed — both `--tree` and `-o`/the oneline callback are
+# deprecated for removal in ansible-core 2.23, so this deliberately doesn't
+# use either):
+#   hostname | SUCCESS => {
+#       "ansible_facts": { ... },
+#       "changed": false
+#   }
+# Both success and unreachable/failed results use this same "=> {...}"
+# shape in default output, so one parser handles both — a host is simply
+# absent from the returned dict if its JSON has no ansible_facts key (or
+# didn't match at all).
+ANSIBLE_RESULT_MARKER_RE = re.compile(
+    r"^(?P<host>\S+) \| \S+(?: \| rc=\d+)? => ", re.MULTILINE,
+)
+
+
+def gather_facts(hosts, keys, opts):
+    """Returns {host: {key: value, ...}} for hosts ansible could reach.
+
+    keys=None (or empty) fetches every fact, unfiltered — used by `facts`.
+    Unreachable/failed hosts are simply absent from the result — the caller
+    decides how to treat that. Reuses Ansible's own fact cache automatically
+    if fact_caching is configured in ansible.cfg; otherwise gathers live.
+    """
+    inventory = determine_inventory(opts.inventory)
+    info(f"gathering facts ({', '.join(sorted(set(keys))) if keys else 'all'}) "
+         f"for {len(hosts)} host(s)")
+    cmd = ["ansible", ",".join(hosts), "-m", "setup"]
+    if keys:
+        cmd += ["-a", f"filter={','.join(sorted(set(keys)))}"]
+    if inventory:
+        cmd += ["-i", inventory]
+    user = effective_remote_user(opts)
+    if user:
+        cmd += ["-u", user]
+    debug_cmd(cmd)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        die("'ansible' not found on PATH. Is ansible-core installed?")
+    debug_block("ansible -m setup stdout", proc.stdout)
+    debug_block("ansible -m setup stderr", proc.stderr)
+
+    decoder = json.JSONDecoder()
+    facts = {}
+    for m in ANSIBLE_RESULT_MARKER_RE.finditer(proc.stdout):
+        try:
+            data, _ = decoder.raw_decode(proc.stdout, m.end())
+        except json.JSONDecodeError:
+            continue
+        host_facts = data.get("ansible_facts")
+        if host_facts:
+            facts[m.group("host")] = host_facts
+    debug_json("gathered facts", facts)
+    return facts
+
+
+def gather_inventory_vars(hosts, opts):
+    """Returns {host: {var: value, ...}} from Ansible inventory itself
+    (host_vars/group_vars/inline vars) — NOT gathered facts. Cheap: just a
+    config read, no SSH connection needed, so always fetched whenever
+    --where is used regardless of whether any clause actually needs it.
+    """
+    inventory = determine_inventory(opts.inventory)
+    cmd = ["ansible-inventory", "--list"]
+    if inventory:
+        cmd += ["-i", inventory]
+    debug_cmd(cmd)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        die("'ansible-inventory' not found on PATH. Is ansible-core installed?")
+    debug_block("ansible-inventory stdout", proc.stdout)
+    debug_block("ansible-inventory stderr", proc.stderr)
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {}
+    all_hostvars = data.get("_meta", {}).get("hostvars", {})
+    return {h: all_hostvars[h] for h in hosts if h in all_hostvars}
+
+
+def filter_by_where(hosts, wheres, opts):
+    if not wheres:
+        return hosts
+
+    parsed = [(parse_path(k), op, v) for k, op, v in wheres]
+    top_level_keys = {segs[0] for segs, _, _ in parsed if segs}
+
+    inv_vars = gather_inventory_vars(hosts, opts)
+    facts = gather_facts(hosts, top_level_keys, opts)
+
+    matched, unreachable = [], []
+    for host in hosts:
+        # Gathered facts win over inventory vars on key collision, same
+        # precedence order Ansible itself uses.
+        merged = {**inv_vars.get(host, {}), **facts.get(host, {})}
+        if all(where_matches(merged, segs, op, v) for segs, op, v in parsed):
+            matched.append(host)
+        elif host not in facts:
+            # No fact data at all for this host, and it didn't match on
+            # inventory vars alone — genuinely unknown, not just a
+            # confident non-match, so treat it as unreachable.
+            unreachable.append(host)
+
+    if unreachable:
+        hint = "" if DEBUG else " (rerun with --debug to see ansible's output)"
+        warn(f"could not gather facts from {len(unreachable)} host(s), "
+             f"excluded from consideration: {', '.join(sorted(unreachable))}{hint}")
+    if not matched:
+        die("no hosts matched --where filter(s)")
+    info(f"{len(matched)}/{len(hosts)} host(s) matched --where filter(s)")
+    return matched
+
+
+def row_matches(path, value, match_any, match_keys, match_values):
+    val_str = str(value)
+    for pat in match_any:
+        if not (re.search(pat, path) or re.search(pat, val_str)):
+            return False
+    for pat in match_keys:
+        if not re.search(pat, path):
+            return False
+    for pat in match_values:
+        if not re.search(pat, val_str):
+            return False
+    return True
+
+
+def do_facts(hosts, opts):
+    inv_vars = gather_inventory_vars(hosts, opts)
+    facts = gather_facts(hosts, None, opts)
+
+    unreachable = [h for h in hosts if h not in facts]
+    if unreachable:
+        hint = "" if DEBUG else " (rerun with --debug to see ansible's output)"
+        warn(f"could not gather facts from {len(unreachable)} host(s): "
+             f"{', '.join(sorted(unreachable))}{hint}")
+
+    match_any = opts.match or []
+    match_keys = opts.match_keys or []
+    match_values = opts.match_values or []
+
+    for host in hosts:
+        host_facts = facts.get(host, {})
+        host_vars = inv_vars.get(host, {})
+        collisions = set(host_facts) & set(host_vars)
+
+        print(f"{host}:")
+        for label, data, other_label in (
+            ("facts", host_facts, "variable"), ("vars", host_vars, "fact"),
+        ):
+            rows = list(flatten(data))
+            shown = [
+                (p, v) for p, v in rows
+                if row_matches(p, v, match_any, match_keys, match_values)
+            ]
+            print(f"  {label}:")
+            if not shown:
+                if rows:
+                    print(f"    (no matches out of {len(rows)} {label} discovered)")
+                else:
+                    print("    (none discovered)")
+            else:
+                last_top = None
+                for p, v in shown:
+                    top = parse_path(p)[0] if p else p
+                    if top in collisions and top != last_top:
+                        print(f"    *** WARNING: {label[:-1]} {top!r} collides "
+                              f"with an inventory {other_label} of the same "
+                              f"name — facts always win ***")
+                    last_top = top
+                    print(f"    {p} = {v}")
+            info(f"{host}: {len(shown)}/{len(rows)} {label} matched")
+
+    return unreachable
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +508,10 @@ def confirm(host, description, state, width=0):
 # Remote connection spec (ssh/scp/rsync target, honoring --remote-user/--root)
 # ---------------------------------------------------------------------------
 
+def effective_remote_user(opts):
+    return "root" if opts.root else opts.remote_user
+
+
 def remote_spec(host, opts):
     """Build the ssh/scp/rsync connection target for a host.
 
@@ -152,7 +520,7 @@ def remote_spec(host, opts):
     no per-host user data of its own. --remote-user/--root apply one user
     uniformly across the whole invocation instead.
     """
-    user = "root" if opts.root else opts.remote_user
+    user = effective_remote_user(opts)
     return f"{user}@{host}" if user else host
 
 
@@ -166,6 +534,7 @@ def substitute(args, host):
 
 def run_host(host, args, opts):
     argv = ["ssh", remote_spec(host, opts)] + substitute(args, host)
+    debug_cmd(argv)
     try:
         proc = subprocess.run(
             argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -289,9 +658,9 @@ def fixup_ownership(host, target, local_file, opts):
         f"chmod {mode:o} {q}; CHMOD_RC=$?; "
         f"echo PEW_FIXUP CHOWN_RC=$CHOWN_RC CHMOD_RC=$CHMOD_RC"
     )
-    proc = subprocess.run(
-        ["ssh", remote_spec(host, opts), remote_script], capture_output=True, text=True,
-    )
+    fixup_argv = ["ssh", remote_spec(host, opts), remote_script]
+    debug_cmd(fixup_argv)
+    proc = subprocess.run(fixup_argv, capture_output=True, text=True)
     chown_rc = None
     for line in proc.stdout.splitlines():
         if line.startswith("PEW_FIXUP"):
@@ -328,11 +697,19 @@ def build_copy_targets(local_files, remote_path, same):
     ]
 
 
+def rsync_argv(lf, spec, target, opts):
+    argv = ["rsync"]
+    if opts.verbose or opts.debug:
+        argv.append("-v")
+    argv += [lf, f"{spec}:{target}"]
+    return argv
+
+
 def plan_copy(host, targets, opts):
     spec = remote_spec(host, opts)
     lines = []
     for lf, target in targets:
-        lines.append(shlex.join(["rsync", lf, f"{spec}:{target}"]))
+        lines.append(shlex.join(rsync_argv(lf, spec, target, opts)))
         owner, group, mode = effective_owner_group_mode(lf, opts)
         fixup = f"chown {owner}:{group} {target}; chmod {mode:o} {target}"
         lines.append(shlex.join(["ssh", spec, fixup]))
@@ -341,14 +718,16 @@ def plan_copy(host, targets, opts):
 
 def copy_host(host, targets, opts):
     spec = remote_spec(host, opts)
+    output_parts = []
     for lf, target in targets:
-        proc = subprocess.run(
-            ["rsync", lf, f"{spec}:{target}"], capture_output=True, text=True,
-        )
+        argv = rsync_argv(lf, spec, target, opts)
+        debug_cmd(argv)
+        proc = subprocess.run(argv, capture_output=True, text=True)
         if proc.returncode != 0:
             return proc.returncode, (proc.stdout + proc.stderr).strip()
+        output_parts.append(proc.stdout)
         fixup_ownership(host, target, lf, opts)
-    return 0, ""
+    return 0, "".join(output_parts)
 
 
 def copy_description(host, targets, opts):
@@ -366,6 +745,13 @@ def do_copy(hosts, targets, opts):
 
     failures = []
 
+    def report_success(host, output):
+        # rsync is silent on success unless --verbose/--debug added -v, in
+        # which case output holds its real transfer log. Otherwise fall
+        # back to a plain confirmation line so success isn't totally mute.
+        text = output if output.strip() else f"copied {copy_description(host, targets, opts)}"
+        emit(host, text, opts.quiet, False, opts.log_prefix, width)
+
     if opts.parallel:
         max_workers = opts.jobs if opts.jobs else len(hosts)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -374,12 +760,12 @@ def do_copy(hosts, targets, opts):
             }
             for fut in concurrent.futures.as_completed(future_to_host):
                 host = future_to_host[fut]
-                rc, err = fut.result()
+                rc, result = fut.result()
                 if rc != 0:
                     failures.append(host)
-                    warn(f"{host}: rsync failed: {err}")
-                elif not opts.quiet:
-                    print(f"{host:<{width}}: copied {copy_description(host, targets, opts)}")
+                    warn(f"{host}: rsync failed: {result}")
+                else:
+                    report_success(host, result)
         return failures
 
     state = {"yes_all": opts.yes}
@@ -388,15 +774,15 @@ def do_copy(hosts, targets, opts):
         if not confirm(host, desc, state, width):
             print(f"*** {host}: SKIPPED ***")
             continue
-        rc, err = copy_host(host, targets, opts)
+        rc, result = copy_host(host, targets, opts)
         if rc != 0:
             failures.append(host)
-            warn(f"{host}: rsync failed: {err}")
+            warn(f"{host}: rsync failed: {result}")
             if not opts.continue_on_fail:
                 warn("stopping (pass --continue-on-fail/-X to proceed past failures)")
                 break
-        elif not opts.quiet:
-            print(f"{host:<{width}}: copied {copy_description(host, targets, opts)}")
+        else:
+            report_success(host, result)
     return failures
 
 
@@ -418,17 +804,15 @@ def diff_host(host, local_file, opts):
     fd, tmp_path = tempfile.mkstemp(prefix="pew-diff-")
     os.close(fd)
     try:
-        scp_proc = subprocess.run(
-            ["scp", f"{spec}:{local_file}", tmp_path],
-            capture_output=True, text=True,
-        )
+        scp_argv = ["scp", f"{spec}:{local_file}", tmp_path]
+        debug_cmd(scp_argv)
+        scp_proc = subprocess.run(scp_argv, capture_output=True, text=True)
         if scp_proc.returncode != 0:
             return 2, (scp_proc.stdout + scp_proc.stderr).strip()
 
-        diff_proc = subprocess.run(
-            ["diff", "-u", local_file, tmp_path],
-            capture_output=True, text=True,
-        )
+        diff_argv = ["diff", "-u", local_file, tmp_path]
+        debug_cmd(diff_argv)
+        diff_proc = subprocess.run(diff_argv, capture_output=True, text=True)
         output = diff_proc.stdout.replace(tmp_path, f"{spec}:{local_file}")
         return diff_proc.returncode, output
     finally:
@@ -500,6 +884,41 @@ def build_parser():
     filter_parent.add_argument(
         "--sort", "-r", action="store_true", help="Sort hosts before processing",
     )
+    filter_parent.add_argument(
+        "--where", action="append", type=parse_where, metavar="KEY<op>VALUE",
+        help="Narrow --hosts to those matching an inventory variable or "
+             "gathered Ansible fact, e.g. ansible_distribution=Ubuntu or "
+             "ansible_mounts[].mount=/data. KEY is a dotted path; [] means "
+             "'any element of this list', [N] a specific index. <op> is "
+             "one of = != < > <= >= (numeric if both sides parse as "
+             "numbers, string otherwise) or ~= (regex search) — quote the "
+             "whole KEY<op>VALUE, most of these are shell-special. "
+             "Repeatable (AND-ed together). Gathers facts fresh for the "
+             "matched candidates (or reuses Ansible's own fact cache if "
+             "fact_caching is configured).",
+    )
+    filter_parent.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Print informational messages about what pew is doing, to stderr",
+    )
+    filter_parent.add_argument(
+        "--debug", "-d", action="store_true",
+        help="Like --verbose, plus raw data: exact commands run and "
+             "pretty-printed --where fact-gathering output, to stderr",
+    )
+    # --remote-user/--root live here (not host_parent) because --where's fact
+    # gathering opens SSH connections too, so even `list` needs this.
+    user_group = filter_parent.add_mutually_exclusive_group()
+    user_group.add_argument(
+        "--remote-user", "-U", metavar="USER", default=None,
+        help="SSH/SCP/rsync as USER instead of your local username. Applies to "
+             "every matched host and to --where's fact-gathering — pew does "
+             "not read ansible_user from inventory.",
+    )
+    user_group.add_argument(
+        "--root", action="store_true",
+        help="Shortcut for --remote-user root",
+    )
 
     # Flags only meaningful for subcommands that actually act on hosts
     # (not `list`, which just resolves and prints).
@@ -514,16 +933,6 @@ def build_parser():
     host_parent.add_argument(
         "--dry-run", "-n", action="store_true",
         help="Show the command(s) that would run on each host, without running them",
-    )
-    user_group = host_parent.add_mutually_exclusive_group()
-    user_group.add_argument(
-        "--remote-user", "-U", metavar="USER", default=None,
-        help="SSH/SCP as USER instead of your local username. Applies to every "
-             "matched host — pew does not read ansible_user from inventory.",
-    )
-    user_group.add_argument(
-        "--root", action="store_true",
-        help="Shortcut for --remote-user root",
     )
 
     exec_parent = argparse.ArgumentParser(add_help=False, parents=[host_parent])
@@ -602,19 +1011,48 @@ def build_parser():
     sub.add_parser("list", parents=[filter_parent],
                     help="Resolve and print hosts matching --hosts")
 
+    facts_p = sub.add_parser("facts", parents=[filter_parent],
+                              help="Dump gathered facts and inventory variables "
+                                   "for each host, flattened to --where-compatible paths")
+    facts_p.add_argument(
+        "--match", action="append", type=parse_regex, metavar="REGEX",
+        help="Only show rows where REGEX matches the key or the value. "
+             "Repeatable (AND-ed together).",
+    )
+    facts_p.add_argument(
+        "--match-keys", action="append", type=parse_regex, metavar="REGEX",
+        help="Only show rows where REGEX matches the key path. "
+             "Repeatable (AND-ed together, and with --match/--match-values).",
+    )
+    facts_p.add_argument(
+        "--match-values", action="append", type=parse_regex, metavar="REGEX",
+        help="Only show rows where REGEX matches the value. "
+             "Repeatable (AND-ed together, and with --match/--match-keys).",
+    )
+
     return p
 
 
 def main():
+    global VERBOSE, DEBUG
     parser = build_parser()
     opts = parser.parse_args()
+    VERBOSE = opts.verbose
+    DEBUG = opts.debug
+    apply_ansible_config()
 
     hosts = resolve_hosts(opts.hosts, opts.inventory, opts.sort)
+    if opts.where:
+        hosts = filter_by_where(hosts, opts.where, opts)
 
     if opts.action == "list":
         for h in hosts:
             print(h)
         return 0
+
+    if opts.action == "facts":
+        unreachable = do_facts(hosts, opts)
+        return 1 if unreachable else 0
 
     if opts.action == "run":
         command = opts.command

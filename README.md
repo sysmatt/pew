@@ -37,6 +37,12 @@ chmod +x ~/bin/pew
 
 That's it. It's one file.
 
+## Testing against real hosts
+
+`test/` has a small local Docker Compose lab (real `sshd`, two distros)
+for exercising `pew` end-to-end instead of against hand-rolled shims.
+See `test/TESTING.md`.
+
 ## How host selection works
 
 Every subcommand's `--hosts`/`-l` (or, for `list`, a positional
@@ -81,14 +87,44 @@ EOF
 ```
 
 `~/.pewrc` is `key=value` lines; blank lines and lines starting with
-`#` are ignored. Currently the only key read is `inventory`. The value
-can point at a single inventory file *or* a directory (Ansible will
-merge every inventory source found inside it, same as it does for
-`ansible.cfg`'s `inventory=` setting).
+`#` are ignored. The value for `inventory` can point at a single
+inventory file *or* a directory (Ansible will merge every inventory
+source found inside it, same as it does for `ansible.cfg`'s
+`inventory=` setting). **Point it at the actual inventory file or a
+dedicated inventory-only directory — not your whole Ansible project
+root.** If you hand Ansible a directory, it treats every file inside as
+a potential inventory source (recursively), so pointing at a project
+root that also has `roles/`, `playbooks/`, etc. makes Ansible try to
+parse all of that as inventory too, which fails in confusing ways.
 
 `$PEW_INVENTORY` is handy for a one-off shell session (e.g. testing
 against a different inventory) without touching `~/.pewrc` or having
 to remember `--inventory` on every invocation.
+
+### What about the rest of `ansible.cfg`?
+
+`inventory=` only tells `pew` which inventory *source* to use — it
+doesn't give Ansible your project's `ansible.cfg`, which may carry
+settings `pew` has no other way to pass through: `vault_password_file`
+(needed if any inventory/group_vars/host_vars content is
+vault-encrypted), `roles_path`, callback plugin config, etc. Ansible
+only auto-discovers `./ansible.cfg` relative to your *current
+directory* — which is why a command can work when you `cd` into your
+Ansible project tree and fail everywhere else.
+
+Set `ansible_config=` in `~/.pewrc` to fix this the same durable,
+cwd-independent way:
+
+```sh
+cat >> ~/.pewrc <<'EOF'
+ansible_config=/path/to/your/ansible-project/ansible.cfg
+EOF
+```
+
+`pew` exports this as the `ANSIBLE_CONFIG` environment variable before
+every `ansible`/`ansible-inventory` call it makes — unless
+`ANSIBLE_CONFIG` is already set in your environment, in which case that
+always wins and `~/.pewrc` is left alone.
 
 ## Remote user
 
@@ -98,9 +134,10 @@ connects. `pew` doesn't — it only ever asks Ansible for bare hostnames
 what user Ansible would have used. Plain `ssh`/`scp`/`rsync` just fall
 back to your local username, which is frequently not what you want.
 
-`--remote-user`/`-U USER` (available on `run`, `copy`, and `diff` —
-not `list`, which never opens a connection) sets one user for every
-matched host in the invocation:
+`--remote-user`/`-U USER` (available on all five subcommands, including
+`list`/`facts` — since `--where`'s fact-gathering opens SSH connections of its
+own, even `list --where` needs this) sets one user for every matched
+host in the invocation:
 
 ```sh
 pew run --hosts webservers --remote-user deploy -- systemctl status app
@@ -115,6 +152,110 @@ exactly which user you're about to act as before anything runs. The
 hostname *label* on each line of real output (the aligned `host:`
 column, log-file names) always stays the bare hostname regardless —
 only the connection itself changes.
+
+## Targeting by fact or variable — `--where`
+
+`--hosts` selects by Ansible inventory group/pattern. `--where` narrows
+that selection further by matching against gathered Ansible **facts**
+(actual system state — OS, version, hardware) *and* **inventory
+variables** (`ansible_user`, anything from `group_vars`/`host_vars`,
+inline inventory vars) merged into one namespace, gathered facts winning
+on key collision — same precedence Ansible itself uses:
+
+```sh
+pew run --hosts all --where ansible_distribution=Ubuntu \
+    --where ansible_distribution_major_version=26 -- uptime
+
+pew list --hosts all --where custom_group_var=some_value
+```
+
+`KEY` is a dotted path, so nested facts/vars are reachable too — `[]`
+means "any element of this list", `[N]` a specific index:
+
+```sh
+pew list --hosts all --where ansible_default_ipv4.address=10.0.0.5
+pew list --hosts all --where ansible_mounts[].mount=/data
+pew list --hosts all --where ansible_mounts[0].fstype=ext4
+```
+
+`KEY<op>VALUE`, repeatable and AND-ed together. `<op>` is one of:
+
+| op | meaning |
+|---|---|
+| `=` | equality (exact string match) |
+| `!=` | not equal — on a `[]` list path, true only if *no* element equals the value (the logical negation of `=`, not just "flip the comparison") |
+| `<` `>` `<=` `>=` | numeric comparison if both sides parse as numbers, string/lexicographic comparison otherwise |
+| `~=` | regex search (`re.search`, unanchored — add `^`/`$` yourself for anchoring); invalid patterns are rejected immediately with a clear error, before anything runs |
+
+```sh
+pew list --hosts all --where 'ansible_distribution_major_version>=24'
+pew list --hosts all --where 'ansible_distribution!=Ubuntu'
+pew list --hosts all --where 'ansible_kernel~=^6\.'
+```
+
+Quote the whole `KEY<op>VALUE` — `<`, `>`, and `!` are shell-special in
+most shells (redirection, history expansion) and will misbehave
+unquoted.
+
+Available on `list`/`run`/`copy`/`diff`/`facts` alike, same as `--hosts`
+itself — `pew list --hosts X --where Y` to preview exactly who'll be hit, then
+reuse the same flags on `run`/`copy`/`diff`.
+
+How it works: after `--hosts` resolves the candidate list, `pew` runs
+`ansible-inventory --list` (cheap — just reads config, no connection)
+for inventory variables, and `ansible <candidates> -m setup -a
+"filter=..."` against just that candidate set (not your whole
+inventory) for facts, then filters locally against the merged result.
+This is a genuine live gather every time, not a cached read — `ansible
+-m setup` run ad-hoc like this always connects and re-gathers,
+regardless of any `fact_caching` you have configured in `ansible.cfg`.
+(`fact_caching`'s cache-skip behavior is implemented as part of a
+*play's* implicit `gather_facts` step, which ad-hoc mode doesn't have —
+it always executes the exact module you asked for. A successful gather
+here does still write through and refresh that cache for your other,
+playbook-based Ansible usage, it just never reads from it itself.) `pew`
+doesn't maintain any cache of its own. Fact-gathering honors
+`--remote-user`/`--root`, same as everything else; the
+inventory-variable read needs no connection at all.
+
+A host that can't be reached during fact-gathering is only excluded (with
+a warning) if it *also* doesn't match on inventory variables alone — if
+your `--where` clauses are fully satisfied by inventory data, an
+unreachable host still matches normally, since no connection was ever
+needed to answer that particular question.
+
+## Verbose and debug output
+
+Available on all five subcommands, both writing to stderr so they
+never mix into piped/redirected stdout:
+
+- `--verbose`/`-v` — high-level narration of what `pew` is doing:
+  resolving hosts, gathering facts, how many matched, etc.
+- `--debug`/`-d` — everything `--verbose` shows, plus raw data: the
+  exact `ansible`/`ssh`/`scp`/`rsync` command line for every operation,
+  and a pretty-printed JSON dump of whatever `--where` gathered from
+  each host.
+
+```sh
+$ pew list --hosts webservers --where ansible_distribution=Ubuntu --debug
+pew: debug: inventory from --inventory: ...
+pew: resolving hosts for pattern 'webservers'
+pew: debug: + ansible webservers --list-hosts
+pew: resolved 3 host(s)
+pew: debug: + ansible-inventory --list
+pew: gathering facts (ansible_distribution) for 3 host(s)
+pew: debug: + ansible web1,web2,web3 -m setup -a filter=ansible_distribution
+pew: debug: gathered facts:
+{
+  "web1": { "ansible_distribution": "Ubuntu" },
+  ...
+}
+pew: 2/3 host(s) matched --where filter(s)
+web1
+web2
+```
+
+Silent by default — neither flag adds any output unless passed.
 
 ## Subcommands
 
@@ -134,6 +275,49 @@ anywhere — `--hosts` is always required.
 
 Prints one hostname per line — pipe it into `xargs`, a `for` loop,
 whatever.
+
+### `pew facts` — explore facts and inventory variables
+
+```sh
+pew facts --hosts webservers
+pew facts --hosts webservers --match-keys 'ansible_mounts' --match-values 'ext4'
+```
+
+Dumps everything `--where` can see for each host — gathered facts *and*
+inventory variables, kept as two separate, clearly labeled sections
+(unlike `--where`'s merged view) so you can see exactly which source a
+value came from, and immediately spot a collision if one exists. Every
+key is shown flattened to the same dotted/bracket path `--where` expects
+(`ansible_mounts[0].fstype`, `ansible_default_ipv4.address`, ...) — a
+line out of `pew facts` is directly usable as a `--where` clause by just
+appending `<op>value` — that symmetry is the whole point of this command.
+
+Unfiltered, this is a *lot* of output — every fact `ansible -m setup`
+gathers, for every matched host. Narrow it with:
+
+- `--match REGEX` — show a row if REGEX matches the key **or** the value
+- `--match-keys REGEX` — only the key path
+- `--match-values REGEX` — only the value
+
+All three are repeatable and AND together (including with each other):
+`--match-keys foo --match-keys bar --match-values baz` means key matches
+`foo` AND key matches `bar` AND value matches `baz`. Same regex engine
+and unanchored-search semantics as `--where`'s `~=`, validated at parse
+time. `--hosts`/`--where`/`--remote-user`/`--root` all work here too, to
+narrow *which hosts* get dumped — same as everywhere else.
+
+If a section ends up with nothing after filtering, that's shown
+explicitly (`(no matches out of N facts discovered)`), not silently
+omitted — so you can tell "checked, found nothing" apart from an error.
+`--verbose` adds a per-host summary line (`N/M facts matched`, `N/M vars
+matched`) to stderr.
+
+**Collisions**: if an inventory variable happens to share a name with a
+gathered fact (rare, but a user-defined `group_vars`/`host_vars` entry
+can do this), both sections show a `*** WARNING ***` line above the
+colliding rows, since — as with `--where` — the fact silently wins and
+the variable is shadowed. This is the one place `pew` actively surfaces
+that shadowing rather than just applying it quietly.
 
 ### `pew run` — run a command on each host
 
@@ -236,6 +420,22 @@ There's no `sudo` escalation built in; if you need that, run `pew copy`
 as a user that already has the necessary rights, or fix ownership
 out-of-band.
 
+#### Output and `--log-prefix`
+
+`rsync` is silent on success by default, so there's normally nothing to
+show beyond a plain confirmation line. Add `--verbose` (or `--debug`,
+which implies it, same as elsewhere in `pew`) to get `rsync`'s own
+transfer output instead:
+
+```sh
+pew copy --hosts webservers --verbose app.conf /etc/app/app.conf
+```
+
+`--log-prefix PREFIX` works here exactly as it does on `run` — each
+host's output (the real `rsync` output if `--verbose`/`--debug` was
+used, otherwise the fallback confirmation line) is also appended to
+`PREFIX.hostname`.
+
 #### `--same` — push to the identical remote path
 
 ```sh
@@ -275,9 +475,9 @@ permissions, file missing, host unreachable).
 
 ## Dry run
 
-`--dry-run`/`-n` is available on `run`, `copy`, and `diff` (not `list`,
-which already just shows the resolved host set with nothing to
-preview). It prints the exact command(s) that would run on each host,
+`--dry-run`/`-n` is available on `run`, `copy`, and `diff` (not `list`
+or `facts` — both already just read and print, with nothing to preview;
+neither ever changes anything). It prints the exact command(s) that would run on each host,
 in the same layout your real output would use — respecting `--quiet`/
 `--multiline` for `run` — but never touches the network and never
 prompts, regardless of `--yes`:
