@@ -1,6 +1,0 @@
-# Generated/ephemeral — see TESTING.md for how these get (re)created.
-ssh/
-inventory.ini
-logs/**
-!logs/*/
-!logs/*/.gitkeep

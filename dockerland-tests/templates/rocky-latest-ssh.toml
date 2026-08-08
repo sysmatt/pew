@@ -1,8 +1,21 @@
-FROM ubuntu:24.04
+# Rocky Linux + real sshd - same shape as ubuntu-latest-ssh.toml, for
+# distro variety (e.g. testing --where fact-targeting against a real
+# non-Debian family).
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        openssh-server python3 sudo rsync diffutils \
-    && rm -rf /var/lib/apt/lists/*
+[meta]
+type = "rocky-latest-ssh"
+
+[container]
+ssh = true
+code = "ro"      # mounted read-only at /code by default; "rw" or "none" also valid
+mailslot = true  # shared read-write /mailslot dir at .dockerland/mailslot/<container>/
+
+[dockerfile]
+content = '''
+FROM rockylinux:9
+
+RUN dnf install -y openssh-server python3 sudo passwd shadow-utils rsync diffutils \
+    && dnf clean all
 
 RUN useradd -m -s /bin/bash testuser \
     && echo "testuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/testuser \
@@ -18,3 +31,4 @@ RUN chmod +x /usr/local/bin/log-and-run.sh /usr/local/bin/log-sftp.sh /entrypoin
 
 EXPOSE 22
 ENTRYPOINT ["/entrypoint.sh"]
+'''

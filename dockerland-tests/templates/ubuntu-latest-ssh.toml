@@ -1,0 +1,37 @@
+# Ubuntu + real sshd, for exercising ssh/scp/rsync/ansible-dependent tools
+# (e.g. pew) end-to-end instead of docker-exec shims. See dockerland's
+# containers/common harness scripts for what COPY common/... below pulls
+# in - dockerland stages them into the build context automatically
+# whenever [container].ssh = true.
+
+[meta]
+type = "ubuntu-latest-ssh"
+
+[container]
+ssh = true
+code = "ro"      # mounted read-only at /code by default; "rw" or "none" also valid
+mailslot = true  # shared read-write /mailslot dir at .dockerland/mailslot/<container>/
+
+[dockerfile]
+content = '''
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openssh-server python3 sudo rsync diffutils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash testuser \
+    && echo "testuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/testuser \
+    && chmod 440 /etc/sudoers.d/testuser
+
+COPY common/sshd-test-harness.conf /tmp/sshd-test-harness.conf
+RUN cat /tmp/sshd-test-harness.conf >> /etc/ssh/sshd_config && rm /tmp/sshd-test-harness.conf
+
+COPY common/log-and-run.sh /usr/local/bin/log-and-run.sh
+COPY common/log-sftp.sh /usr/local/bin/log-sftp.sh
+COPY common/entrypoint.sh /entrypoint.sh
+RUN chmod +x /usr/local/bin/log-and-run.sh /usr/local/bin/log-sftp.sh /entrypoint.sh
+
+EXPOSE 22
+ENTRYPOINT ["/entrypoint.sh"]
+'''

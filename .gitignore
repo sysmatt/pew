@@ -219,3 +219,12 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .claude
+
+# Old hand-built docker-compose test harness, kept for reference only
+test.old/
+
+# dockerland runtime state (mailslot, exec-logs) - always rooted at git toplevel
+.dockerland/
+
+# generated per-run ssh inventory (machine-specific ports), not source
+dockerland-tests/inventory.ini
