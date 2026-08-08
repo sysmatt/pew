@@ -25,17 +25,28 @@ still depending on it.
   (`rsync` is used for `copy`'s file transfer; `scp` is only used for
   `diff`'s fetch)
 
-No other dependencies. No virtualenv, no `pip install`, nothing to keep
-in sync.
+No third-party Python dependencies — it only shells out to the tools
+above.
 
 ## Install
 
+Symlink it onto your `PATH` (the `pew` script resolves symlinks to find
+its sibling `src/` directory, so this works from wherever you keep the
+clone, and a `git pull` here updates it in place):
+
 ```sh
-cp pew ~/bin/pew      # or /usr/local/bin, wherever you keep personal tools
-chmod +x ~/bin/pew
+ln -s "$(pwd)/pew" ~/bin/pew      # or /usr/local/bin, wherever you keep personal tools
 ```
 
-That's it. It's one file.
+Or, for an isolated install that doesn't depend on keeping the clone
+around, use [pipx](https://pipx.pypa.io/):
+
+```sh
+pipx install .
+```
+
+(`pipx install --editable .` instead, if you're developing pew itself —
+edits to `src/pew.py` take effect immediately without reinstalling.)
 
 ## Testing against real hosts
 
@@ -100,6 +111,11 @@ parse all of that as inventory too, which fails in confusing ways.
 `$PEW_INVENTORY` is handy for a one-off shell session (e.g. testing
 against a different inventory) without touching `~/.pewrc` or having
 to remember `--inventory` on every invocation.
+
+Pass `--pewrc PATH` to use a different rc file entirely — it replaces
+`~/.pewrc` for all three of the settings above and below it
+(`inventory=`, `ansible_config=`, `timestamp_format=`). Useful for
+per-project config, or for testing.
 
 ### What about the rest of `ansible.cfg`?
 
