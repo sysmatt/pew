@@ -48,6 +48,14 @@ pipx install .
 (`pipx install --editable .` instead, if you're developing pew itself —
 edits to `src/pew.py` take effect immediately without reinstalling.)
 
+For a system-wide install available to every user on the box (instead of
+just yourself), add `--global`. This installs to `/opt/pipx` and
+`/usr/local/bin` rather than your own `~/.local/...`, so it needs root:
+
+```sh
+sudo pipx install --global .
+```
+
 ## Testing against real hosts
 
 `test/` has a small local Docker Compose lab (real `sshd`, two distros)
