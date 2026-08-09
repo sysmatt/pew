@@ -161,6 +161,16 @@ every `ansible`/`ansible-inventory` call it makes — unless
 `ANSIBLE_CONFIG` is already set in your environment, in which case that
 always wins and `~/.pewrc` is left alone.
 
+> **Caution:** once `vault_password_file` is configured, Ansible hands
+> `pew` already-decrypted values — vaulted variables become
+> indistinguishable from any other inventory variable. `pew facts`
+> dumps every inventory variable for every matched host, and `--debug`
+> (on any subcommand) pretty-prints the raw gathered facts/vars JSON to
+> stderr — either one will print vaulted secrets in plaintext to your
+> terminal. Be careful where you run these and where that terminal
+> output ends up (screen recordings, shared sessions, shell scrollback
+> capture/logging, CI job output, etc).
+
 ## Remote user
 
 Ansible resolves `ansible_user` per host from inventory when it
@@ -269,7 +279,8 @@ never mix into piped/redirected stdout:
 - `--debug`/`-d` — everything `--verbose` shows, plus raw data: the
   exact `ansible`/`ssh`/`scp`/`rsync` command line for every operation,
   and a pretty-printed JSON dump of whatever `--where` gathered from
-  each host.
+  each host (see the **Caution** under `ansible_config=` above if any
+  inventory content is vault-encrypted).
 
 ```sh
 $ pew list --hosts webservers --where ansible_distribution=Ubuntu --debug
@@ -330,7 +341,9 @@ line out of `pew facts` is directly usable as a `--where` clause by just
 appending `<op>value` — that symmetry is the whole point of this command.
 
 Unfiltered, this is a *lot* of output — every fact `ansible -m setup`
-gathers, for every matched host. Narrow it with:
+gathers, for every matched host, plus every inventory variable — see the
+**Caution** under `ansible_config=` above if any of those are
+vault-encrypted. Narrow it with:
 
 - `--match REGEX` — show a row if REGEX matches the key **or** the value
 - `--match-keys REGEX` — only the key path
