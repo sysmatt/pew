@@ -80,6 +80,15 @@ def debug_block(label, text):
 PEWRC_PATH = os.path.expanduser("~/.pewrc")
 
 
+def determine_pewrc_path(cli_pewrc):
+    """--pewrc flag > $PEW_PEWRC > ~/.pewrc (the default already in PEWRC_PATH)."""
+    if cli_pewrc:
+        return cli_pewrc
+    if os.environ.get("PEW_PEWRC"):
+        return os.environ["PEW_PEWRC"]
+    return None
+
+
 def load_pewrc():
     """Parse ~/.pewrc as simple key=value lines. Missing file -> {}."""
     if not os.path.isfile(PEWRC_PATH):
@@ -112,6 +121,18 @@ def determine_inventory(cli_inventory):
     else:
         debug("no inventory override found; letting ansible resolve its own default")
     return from_rc
+
+
+def determine_hosts(cli_hosts):
+    """--hosts flag > ~/.pewrc [hosts_default=] > error."""
+    if cli_hosts:
+        debug(f"hosts from --hosts: {cli_hosts}")
+        return cli_hosts
+    from_rc = load_pewrc().get("hosts_default")
+    if from_rc:
+        debug(f"hosts from {PEWRC_PATH}: {from_rc}")
+        return from_rc
+    die("no --hosts/-l given, and no hosts_default= set in " + PEWRC_PATH)
 
 
 def apply_ansible_config():
@@ -1039,8 +1060,9 @@ def build_parser():
     # you can trust it resolves to exactly the same set of systems.
     filter_parent = argparse.ArgumentParser(add_help=False)
     filter_parent.add_argument(
-        "--hosts", "-l", required=True, metavar="PATTERN",
-        help="Ansible host pattern, e.g. webservers, 'web:&staging', host1,host2",
+        "--hosts", "-l", metavar="PATTERN",
+        help="Ansible host pattern, e.g. webservers, 'web:&staging', host1,host2 "
+             "(default: ~/.pewrc's hosts_default=, if set)",
     )
     filter_parent.add_argument(
         "--inventory", "-i", metavar="PATH",
@@ -1049,7 +1071,8 @@ def build_parser():
     filter_parent.add_argument(
         "--pewrc", metavar="PATH",
         help="Use PATH instead of ~/.pewrc for inventory=/ansible_config=/"
-             "timestamp_format= overrides",
+             "hosts_default=/timestamp_format= overrides. Same as "
+             "$PEW_PEWRC, which this takes precedence over.",
     )
     filter_parent.add_argument(
         "--sort", "-r", action="store_true", help="Sort hosts before processing",
@@ -1243,11 +1266,13 @@ def main():
         opts = parser.parse_args()
         VERBOSE = opts.verbose
         DEBUG = opts.debug
-        if opts.pewrc:
-            if not os.path.isfile(opts.pewrc):
-                warn(f"--pewrc path does not exist: {opts.pewrc}")
-            PEWRC_PATH = opts.pewrc
+        pewrc_override = determine_pewrc_path(opts.pewrc)
+        if pewrc_override:
+            if not os.path.isfile(pewrc_override):
+                warn(f"--pewrc/$PEW_PEWRC path does not exist: {pewrc_override}")
+            PEWRC_PATH = pewrc_override
         apply_ansible_config()
+        opts.hosts = determine_hosts(opts.hosts)
 
         hosts = resolve_hosts(opts.hosts, opts.inventory, opts.sort)
         if opts.where:

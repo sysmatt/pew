@@ -73,6 +73,10 @@ dt::generate_inventory() {
 # eval this in the CALLING shell to get ssh/scp on PATH pointed at dockerland's
 # isolated ssh_config, e.g.: eval "$(dt::activate_cmd)"
 dt::activate_cmd() {
+    # dockerland activate now decorates $PS1 (export DOCKERLAND_OLD_PS1="$PS1"),
+    # which is normally unset in a non-interactive script - give it a default
+    # first so that doesn't trip `set -u`.
+    echo 'export PS1="${PS1:-}"'
     dockerland activate
 }
 

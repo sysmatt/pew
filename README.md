@@ -10,10 +10,11 @@ If you want to pew pew your foot off, pew is the tool for you!
 Perl tool called `mew` (1998–2001), which did the same job by reading a
 hand-maintained `.mewrc` file of hosts and groups. `pew` drops that
 entirely in favor of Ansible inventory, drops legacy rsh/PKIDO transport
-in favor of plain SSH, and is a single, dependency-free Python file. It
-is **not** a drop-in replacement — flags and behavior are deliberately
-reimagined, not ported 1:1. The old `mew` remains as-is for anything
-still depending on it.
+in favor of plain SSH, and is dependency-free (pure standard library —
+see **Install** below for the couple of ways to get it onto your
+machine). It is **not** a drop-in replacement — flags and behavior are
+deliberately reimagined, not ported 1:1. The old `mew` remains as-is for
+anything still depending on it.
 
 ## Requirements
 
@@ -58,9 +59,12 @@ sudo pipx install --global .
 
 ## Testing against real hosts
 
-`test/` has a small local Docker Compose lab (real `sshd`, two distros)
-for exercising `pew` end-to-end instead of against hand-rolled shims.
-See `test/TESTING.md`.
+`dockerland-tests/` has a suite of scripts (one per feature area, plus a
+10-container stress test) that exercise `pew` end-to-end against real
+`sshd` containers — ubuntu and rocky — brought up on demand via
+`dockerland`, a companion container-harness tool, rather than
+hand-rolled shims. Run `dockerland-tests/run_all.sh` for the whole
+suite, or any `dockerland-tests/NN_*.sh` script individually.
 
 ## How host selection works
 
@@ -83,6 +87,12 @@ with no extra logic in `pew` itself:
 | `webservers:&staging` | intersection — in `webservers` *and* `staging` |
 | `webservers:!canary` | `webservers` *except* `canary` |
 | `~web\d+\.example\.com` | regex match |
+
+`--hosts`/`-l` itself is optional if `~/.pewrc` sets `hosts_default=` —
+useful if you mostly run pew against the same group and don't want to
+type `--hosts` every time. An explicit `--hosts` on the command line
+always overrides it. With neither set, pew errors out rather than
+silently defaulting to `all`.
 
 ### Which inventory does it use?
 
@@ -120,10 +130,11 @@ parse all of that as inventory too, which fails in confusing ways.
 against a different inventory) without touching `~/.pewrc` or having
 to remember `--inventory` on every invocation.
 
-Pass `--pewrc PATH` to use a different rc file entirely — it replaces
-`~/.pewrc` for all three of the settings above and below it
-(`inventory=`, `ansible_config=`, `timestamp_format=`). Useful for
-per-project config, or for testing.
+Pass `--pewrc PATH` (or set `$PEW_PEWRC`; `--pewrc` wins if both are
+set) to use a different rc file entirely — it replaces `~/.pewrc` for
+every setting on this page (`inventory=`, `ansible_config=`,
+`hosts_default=`, `timestamp_format=`). Useful for per-project config,
+or for testing.
 
 ### What about the rest of `ansible.cfg`?
 
@@ -294,8 +305,10 @@ pew list --hosts 'webservers:&staging' --sort
 included. That's deliberate: run `pew list --hosts X` to see exactly
 who `X` resolves to, then reuse that same `--hosts X` on `run`/`copy`/
 `diff` and know you're hitting the same set of systems. There's no
-separate positional pattern argument or implicit "all hosts" default
-anywhere — `--hosts` is always required.
+separate positional pattern argument, and no implicit "all hosts"
+default — omitting `--hosts` falls back to `~/.pewrc`'s
+`hosts_default=` if set (see **How host selection works** above), or
+errors out if that isn't set either.
 
 Prints one hostname per line — pipe it into `xargs`, a `for` loop,
 whatever.

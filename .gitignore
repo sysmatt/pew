@@ -220,9 +220,6 @@ __marimo__/
 .streamlit/secrets.toml
 .claude
 
-# Old hand-built docker-compose test harness, kept for reference only
-test.old/
-
 # dockerland runtime state (mailslot, exec-logs) - always rooted at git toplevel
 .dockerland/
 
