@@ -58,6 +58,15 @@ just yourself), add `--global`. This installs to `/opt/pipx` and
 sudo pipx install --global .
 ```
 
+pipx also installs two shortcuts, `pes` (= `pew shell`) and `per`
+(= `pew run`) — see [Shortcuts](#shortcuts-pes-and-per). With the
+symlink install, add them yourself:
+
+```sh
+ln -s "$(pwd)/pew" ~/bin/pes
+ln -s "$(pwd)/pew" ~/bin/per
+```
+
 ## Testing against real hosts
 
 `dockerland-tests/` has a suite of scripts (one per feature area, plus a
@@ -69,8 +78,21 @@ suite, or any `dockerland-tests/NN_*.sh` script individually.
 
 ## How host selection works
 
-Every subcommand's `--hosts`/`-l` (or, for `list`, a positional
-argument) takes an **Ansible host pattern**, resolved via:
+Every subcommand takes an **Ansible host pattern**, either as HOST,
+the first positional argument, or with `--hosts`/`-l`:
+
+```sh
+pew run web -- uptime              # same as: pew run --hosts web -- uptime
+pew copy web app.conf /etc/app/    # same as: pew copy -l web app.conf /etc/app/
+pew list 'web:&staging'
+```
+
+With `--hosts`/`-l` there is no HOST positional, so the first positional
+is the command (`run`) or the first file (`copy`, `diff`). Giving both is
+an error. Options can go before or after HOST. For `run`, everything from
+the command onward is the command's, its own flags included.
+
+The pattern is resolved via:
 
 ```sh
 ansible '<pattern>' --list-hosts
@@ -89,11 +111,36 @@ with no extra logic in `pew` itself:
 | `webservers:!canary` | `webservers` *except* `canary` |
 | `~web\d+\.example\.com` | regex match |
 
-`--hosts`/`-l` itself is optional if `~/.pewrc` sets `hosts_default=` —
-useful if you mostly run pew against the same group and don't want to
-type `--hosts` every time. An explicit `--hosts` on the command line
-always overrides it. With neither set, pew errors out rather than
-silently defaulting to `all`.
+The host is optional if `~/.pewrc` sets `hosts_default=`, which is
+useful if you mostly run pew against the same group. Since the first
+positional is always HOST, you skip it by passing `-` in its place, or
+`--` before a `run` command (nothing after `--` is ever HOST):
+
+```sh
+pew run - uptime                   # hosts_default=
+pew run -- uptime                  # hosts_default=
+pew list                           # hosts_default= (list/facts have no other positionals)
+pew diff - /etc/app/app.conf       # hosts_default=
+```
+
+An explicit HOST or `--hosts` always overrides it. With neither set,
+pew errors out rather than silently defaulting to `all`.
+
+A pattern that matches nothing is an error, and pew lists the inventory
+hosts and groups that look like what you typed (on stderr), so a typo
+or a missing domain doesn't send you off to grep the inventory:
+
+```
+$ pew run aplha uptime
+pew: error: host pattern 'aplha' matched no hosts
+similar hosts:
+  alpha-rtr.example.com
+```
+
+Suggestions are names containing what you typed, then close spellings of
+a name or any `.`/`-`/`_`-separated part of it, up to 10 of each. In a
+compound pattern (`web:&stagin`) only the terms that aren't already a
+host or group name are looked up.
 
 ### Which inventory does it use?
 
@@ -370,21 +417,34 @@ candidates — never a guess. Since a future subcommand can make today's
 short prefix ambiguous (a `sync` would turn `s` into an error), **use
 full names in scripts**; prefixes are for typing.
 
-### `pew list` — see who a `--hosts` pattern resolves to
+### Shortcuts: `pes` and `per`
+
+Run under the name `pes`, pew acts as `pew shell`; under `per`, as
+`pew run`. Everything after is passed through unchanged:
 
 ```sh
-pew list --hosts webservers
-pew list --hosts 'webservers:&staging' --sort
+pes alpha                            # pew shell alpha
+pes alpha --root -- htop             # pew shell alpha --root -- htop
+per web uptime                       # pew run web uptime
 ```
 
-`--hosts`/`-l` works identically across every subcommand — `list`
-included. That's deliberate: run `pew list --hosts X` to see exactly
-who `X` resolves to, then reuse that same `--hosts X` on `run`/`copy`/
-`diff` and know you're hitting the same set of systems. There's no
-separate positional pattern argument, and no implicit "all hosts"
-default — omitting `--hosts` falls back to `~/.pewrc`'s
-`hosts_default=` if set (see **How host selection works** above), or
-errors out if that isn't set either.
+It's keyed on the name pew was invoked as, so it works the same for the
+pipx entry points and for a symlink to `./pew` (see **Install**).
+
+### `pew list` — see who a host pattern resolves to
+
+```sh
+pew list webservers
+pew list 'webservers:&staging' --sort
+```
+
+HOST and `--hosts`/`-l` work identically across every subcommand, `list`
+included. That's deliberate: run `pew list X` to see exactly who `X`
+resolves to, then reuse that same `X` on `run`/`copy`/`diff` and know
+you're hitting the same set of systems. There's no implicit "all hosts"
+default: omitting HOST falls back to `~/.pewrc`'s `hosts_default=` if
+set (see **How host selection works** above), or errors out if that
+isn't set either.
 
 Prints one hostname per line — pipe it into `xargs`, a `for` loop,
 whatever.
@@ -392,7 +452,7 @@ whatever.
 ### `pew facts` — explore facts and inventory variables
 
 ```sh
-pew facts --hosts webservers
+pew facts webservers
 pew facts --hosts webservers --match-keys 'ansible_mounts' --match-values 'ext4'
 ```
 
@@ -437,7 +497,8 @@ that shadowing rather than just applying it quietly.
 ### `pew run` — run a command on each host
 
 ```sh
-pew run --hosts webservers -- uptime
+pew run webservers uptime
+pew run --hosts webservers -- uptime     # the same
 ```
 
 By default this asks per host before running (see **Confirm loop**
@@ -576,7 +637,7 @@ noise on every line works against that.
 ### `pew copy` — push file(s) to each host
 
 ```sh
-pew copy --hosts webservers app.conf /etc/app/app.conf
+pew copy webservers app.conf /etc/app/app.conf
 pew copy --hosts webservers file1.txt file2.txt /etc/app/configs/
 ```
 
@@ -651,7 +712,7 @@ destination path twice.
 ### `pew diff` — compare a local file against each host
 
 ```sh
-pew diff --hosts webservers /etc/app/app.conf
+pew diff webservers /etc/app/app.conf
 ```
 
 Fetches the file from each host into a temp file, runs `diff -u`
@@ -728,6 +789,13 @@ as with `run`. A command *without* `--` is an error rather than a guess.
 
 `--dry-run`/`-n` prints the `ssh` command instead of running it — handy
 for pasting somewhere else.
+
+`shell` drops a `+suffix` from the username: `ansible_user=admin+ct`
+connects as `admin`. MikroTik reads console options from that suffix
+(`+c` no colors, `+t` no terminal detection, ...), which suit scripted
+`run`s but make an interactive session worse. It applies to `--remote-user`
+too, and only to `shell` — `run`, `copy`, `diff`, and `--where`'s fact
+gathering still use the full name. Pass `--no-munge-username` to keep it.
 
 ## Dry run
 

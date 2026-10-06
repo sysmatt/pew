@@ -11,6 +11,7 @@ Spiritual successor to the old Perl "mew" tool. Not flag-compatible with it.
 import argparse
 import concurrent.futures
 import datetime
+import difflib
 import grp
 import json
 import os
@@ -25,6 +26,19 @@ import tempfile
 import threading
 
 PROG = "pew"
+
+# Installed under one of these names (pipx entry point or a symlink to
+# ./pew), pew behaves as if that subcommand had been typed first:
+# `pes alpha` is `pew shell alpha`. Keyed on basename(argv[0]).
+PROG_ALIASES = {"pes": "shell", "per": "run"}
+
+# Subcommands whose first positional is HOST unless --hosts/-l is given
+# (`pew run web uptime`). `-` as HOST means ~/.pewrc's hosts_default=.
+# shell has its own HOST positional and isn't listed.
+HOST_POSITIONAL = ("run", "copy", "diff", "list", "facts")
+HOST_EPILOG = ("HOST is an Ansible host pattern, the same as --hosts. It's "
+               "the first positional unless --hosts/-l is given; use - for "
+               "~/.pewrc's hosts_default=.")
 
 
 def die(msg, code=1):
@@ -132,7 +146,7 @@ def determine_hosts(cli_hosts):
     if from_rc:
         debug(f"hosts from {PEWRC_PATH}: {from_rc}")
         return from_rc
-    die("no --hosts/-l given, and no hosts_default= set in " + PEWRC_PATH)
+    die("no HOST or --hosts/-l given, and no hosts_default= set in " + PEWRC_PATH)
 
 
 def apply_ansible_config():
@@ -182,11 +196,79 @@ def resolve_hosts(pattern, inventory=None, sort=False, allow_empty=False):
     if not hosts:
         if allow_empty:
             return []
-        die(f"host pattern {pattern!r} matched no hosts")
+        die(no_match_message(pattern, inventory))
     hosts = sorted(hosts) if sort else hosts
     info(f"resolved {len(hosts)} host(s)")
     debug(f"host list: {', '.join(hosts)}")
     return hosts
+
+
+SUGGEST_LIMIT = 10
+
+
+def pattern_terms(pattern):
+    """The plain names in an Ansible pattern, for suggestions: split on
+    `,`/`:`, minus `&`/`!` prefixes, glob characters, `[n:m]` ranges, and
+    `~regex` terms (which aren't names at all). One-letter terms are
+    dropped too: as substrings they match nearly everything."""
+    terms = []
+    for term in re.split(r"[,:]", re.sub(r"\[[^\]]*\]", "", pattern)):
+        term = term.lstrip("&!")
+        if term.startswith("~"):
+            continue
+        term = re.sub(r"[*?]", "", term)
+        if len(term) >= 2 and term != "all":
+            terms.append(term)
+    return terms
+
+
+def similar_names(needles, names):
+    """Names resembling any needle, case-insensitively: substring matches
+    first, then close spellings (difflib) of the whole name or any of its
+    `.`/`-`/`_`-separated parts (`aplha` -> alpha-rtr.example.com)."""
+    keys = {}
+    for name in names:
+        lower = name.lower()
+        for key in [lower] + [p for p in re.split(r"[._-]", lower) if len(p) >= 3]:
+            keys.setdefault(key, set()).add(name)
+    found = {}
+    for needle in needles:
+        n = needle.lower()
+        for name in names:
+            if n in name.lower():
+                found.setdefault(name)
+        scored = {}
+        for key, owners in keys.items():
+            ratio = difflib.SequenceMatcher(None, n, key).ratio()
+            if ratio >= 0.6:
+                for name in owners:
+                    scored[name] = max(ratio, scored.get(name, 0))
+        for name in sorted(scored, key=lambda x: (-scored[x], x)):
+            found.setdefault(name)
+    return list(found)
+
+
+def no_match_message(pattern, inventory):
+    """The `matched no hosts` error, plus hosts and groups resembling the
+    pattern's unknown names, if there are any."""
+    msg = f"host pattern {pattern!r} matched no hosts"
+    data = load_inventory_json(inventory)
+    groups = [g for g in data if g not in ("_meta", "all", "ungrouped")]
+    hosts = set(data.get("_meta", {}).get("hostvars", {}))
+    for g in groups + ["ungrouped"]:
+        hosts.update(data[g].get("hosts", []) if isinstance(data.get(g), dict) else [])
+    hosts = sorted(hosts)
+    known = set(hosts) | set(groups)
+    needles = [t for t in pattern_terms(pattern) if t not in known]
+    for label, names in (("hosts", hosts), ("groups", sorted(groups))):
+        similar = similar_names(needles, names)
+        if not similar:
+            continue
+        msg += f"\nsimilar {label}:"
+        msg += "".join(f"\n  {n}" for n in similar[:SUGGEST_LIMIT])
+        if len(similar) > SUGGEST_LIMIT:
+            msg += f"\n  ... and {len(similar) - SUGGEST_LIMIT} more"
+    return msg
 
 
 # ---------------------------------------------------------------------------
@@ -366,13 +448,9 @@ def gather_facts(hosts, keys, opts):
     return facts
 
 
-def gather_inventory_vars(hosts, opts):
-    """Returns {host: {var: value, ...}} from Ansible inventory itself
-    (host_vars/group_vars/inline vars) — NOT gathered facts. Cheap: just a
-    config read, no SSH connection needed, so always fetched whenever
-    --where is used regardless of whether any clause actually needs it.
-    """
-    inventory = determine_inventory(opts.inventory)
+def load_inventory_json(inventory):
+    """`ansible-inventory --list` as parsed JSON, or {} if it isn't."""
+    inventory = determine_inventory(inventory)
     cmd = ["ansible-inventory", "--list"]
     if inventory:
         cmd += ["-i", inventory]
@@ -384,9 +462,18 @@ def gather_inventory_vars(hosts, opts):
     debug_block("ansible-inventory stdout", proc.stdout)
     debug_block("ansible-inventory stderr", proc.stderr)
     try:
-        data = json.loads(proc.stdout)
+        return json.loads(proc.stdout)
     except json.JSONDecodeError:
         return {}
+
+
+def gather_inventory_vars(hosts, opts):
+    """Returns {host: {var: value, ...}} from Ansible inventory itself
+    (host_vars/group_vars/inline vars) — NOT gathered facts. Cheap: just a
+    config read, no SSH connection needed, so always fetched whenever
+    --where is used regardless of whether any clause actually needs it.
+    """
+    data = load_inventory_json(opts.inventory)
     all_hostvars = data.get("_meta", {}).get("hostvars", {})
     return {h: all_hostvars[h] for h in hosts if h in all_hostvars}
 
@@ -637,13 +724,21 @@ def host_connection(host, opts):
     return connections.get(host) or {"address": host}
 
 
-def remote_spec(host, opts):
+def remote_spec(host, opts, munge_user=False):
     """Build the ssh/scp/rsync connection target for a host: its rendered
     ansible_host as [user@]address. --remote-user/--root override
     ansible_user uniformly across the whole invocation.
+
+    munge_user drops a `+...` suffix from the user: MikroTik reads console
+    options from it (admin+ct), and those are wrong for an interactive
+    session. `shell` asks for this unless --no-munge-username.
     """
     conn = host_connection(host, opts)
     user = effective_remote_user(opts) or conn.get("user")
+    if munge_user and user and "+" in user:
+        munged = user.split("+", 1)[0]
+        debug(f"username {user!r} munged to {munged!r} (--no-munge-username to keep it)")
+        user = munged
     address = conn.get("address") or host
     return f"{user}@{address}" if user else address
 
@@ -665,8 +760,8 @@ def ssh_options(host, opts, tool="ssh"):
     return options
 
 
-def ssh_argv(host, opts):
-    return ["ssh"] + ssh_options(host, opts) + [remote_spec(host, opts)]
+def ssh_argv(host, opts, munge_user=False):
+    return ["ssh"] + ssh_options(host, opts) + [remote_spec(host, opts, munge_user)]
 
 
 # ---------------------------------------------------------------------------
@@ -1201,7 +1296,7 @@ def resolve_shell_host(pattern, opts):
         hosts = match_plain_name(pattern, opts.inventory)
         fuzzy = True
     if not hosts:
-        die(f"host pattern {pattern!r} matched no hosts")
+        die(no_match_message(pattern, opts.inventory))
     if opts.where:
         hosts = filter_by_where(hosts, opts.where, opts)
     if len(hosts) != 1:
@@ -1217,7 +1312,7 @@ def do_shell(host, command, opts):
     """Replace this process with ssh to host, so ssh owns the terminal,
     signals, and exit code outright. With a command, -t forces a TTY for
     it (the thing `run`, which captures output, can't give you)."""
-    argv = ssh_argv(host, opts)
+    argv = ssh_argv(host, opts, munge_user=not opts.no_munge_username)
     if command:
         argv = argv[:1] + ["-t"] + argv[1:] + substitute(command, host)
     if opts.dry_run:
@@ -1377,6 +1472,8 @@ def build_parser():
     sub = p.add_subparsers(dest="action", required=True)
 
     run_p = sub.add_parser("run", parents=[exec_parent],
+                            usage="%(prog)s [options] HOST [--] COMMAND...",
+                            epilog=HOST_EPILOG,
                             help="Run a command on each host")
     output_mode = run_p.add_mutually_exclusive_group()
     output_mode.add_argument(
@@ -1399,6 +1496,8 @@ def build_parser():
     )
 
     copy_p = sub.add_parser("copy", parents=[exec_parent],
+                             usage="%(prog)s [options] HOST SOURCE... DEST",
+                             epilog=HOST_EPILOG,
                              help="Copy file(s) to each host, preserving mode "
                                   "and best-effort owner/group")
     copy_p.add_argument(
@@ -1427,6 +1526,8 @@ def build_parser():
     )
 
     diff_p = sub.add_parser("diff", parents=[host_parent],
+                             usage="%(prog)s [options] HOST LOCAL_FILE",
+                             epilog=HOST_EPILOG,
                              help="Diff a local file against the same path on each host")
     diff_p.add_argument(
         "--continue-on-fail", "-X", action="store_true",
@@ -1435,9 +1536,13 @@ def build_parser():
     diff_p.add_argument("local_file", help="Local file to diff against each host")
 
     sub.add_parser("list", parents=[filter_parent],
-                    help="Resolve and print hosts matching --hosts")
+                    usage="%(prog)s [options] [HOST]",
+                    epilog=HOST_EPILOG,
+                    help="Resolve and print hosts matching HOST/--hosts")
 
     facts_p = sub.add_parser("facts", parents=[filter_parent],
+                              usage="%(prog)s [options] [HOST]",
+                              epilog=HOST_EPILOG,
                               help="Dump gathered facts and inventory variables "
                                    "for each host, flattened to --where-compatible paths")
     facts_p.add_argument(
@@ -1467,6 +1572,12 @@ def build_parser():
         help="Print the ssh command instead of running it",
     )
     shell_p.add_argument(
+        "--no-munge-username", action="store_true",
+        help="Keep a +suffix on the username. By default shell drops it "
+             "(admin+ct -> admin): MikroTik reads console options from it, "
+             "which suit scripted runs but not an interactive session.",
+    )
+    shell_p.add_argument(
         "target", nargs="?", metavar="HOST",
         help="Ansible host pattern that must resolve to exactly one host "
              "(same as --hosts). A plain name matching nothing falls back to "
@@ -1474,7 +1585,71 @@ def build_parser():
              "case-insensitive substring match (qth0 -> qth0-router.example.com).",
     )
     p.subcommands = list(sub.choices)
+    p.subparsers = sub.choices
     return p
+
+
+def scan_option(token, subparser):
+    """For an option token, return (is_hosts, consumes_next): whether it is
+    --hosts/-l, and whether its value is the next token. Mirrors argparse:
+    --opt=value, unique long-option prefixes, -xVALUE, and bundled short
+    flags (-qP). Unknown options take no value; argparse reports them."""
+    actions = subparser._option_string_actions
+    if token.startswith("--"):
+        name, eq, _ = token.partition("=")
+        action = actions.get(name)
+        if action is None:
+            matches = {a for o, a in actions.items() if o.startswith(name)}
+            action = matches.pop() if len(matches) == 1 else None
+        if action is None:
+            return False, False
+        return action.dest == "hosts", action.nargs != 0 and not eq
+    for i, ch in enumerate(token[1:], start=1):
+        action = actions.get("-" + ch)
+        if action is None:
+            return False, False
+        if action.nargs != 0:
+            return action.dest == "hosts", i == len(token) - 1
+    return False, False
+
+
+def extract_host_positional(argv, parser):
+    """Turn a leading HOST positional into --hosts HOST, so argparse never
+    sees it (`run web -P uptime` -> `run --hosts web -P uptime`). Options may
+    sit before or after HOST. With --hosts/-l anywhere before it there is no
+    HOST positional; giving both is an error. HOST `-` is dropped, leaving
+    ~/.pewrc's hosts_default= to apply. Nothing after `--` is ever HOST.
+    For run, the next positional after HOST starts the command, and
+    everything from there on is the command's, options included."""
+    subparser = parser.subparsers[argv[0]]
+    hosts_flag = False
+    host_idx = None
+    i = 1
+    while i < len(argv):
+        token = argv[i]
+        if token == "--":
+            break
+        if token.startswith("-") and token != "-":
+            is_hosts, consumes_next = scan_option(token, subparser)
+            if is_hosts:
+                if host_idx is not None:
+                    die("give hosts either as HOST or --hosts/-l, not both")
+                hosts_flag = True
+            i += 2 if consumes_next else 1
+            continue
+        if hosts_flag or (host_idx is not None and argv[0] == "run"):
+            break
+        if host_idx is None:
+            host_idx = i
+        i += 1
+    if host_idx is None:
+        return argv
+    host = argv[host_idx]
+    rest = argv[1:host_idx] + argv[host_idx + 1:]
+    if host == "-":
+        debug("HOST '-': using hosts_default=")
+        return argv[:1] + rest
+    return argv[:1] + ["--hosts", host] + rest
 
 
 def expand_subcommand(word, names):
@@ -1502,8 +1677,13 @@ def main():
         # given after HOST (`pew shell web1 --root -- sudo -i`). The
         # subcommand is always argv[0], the top-level parser has no options.
         argv = sys.argv[1:]
+        alias = PROG_ALIASES.get(os.path.basename(sys.argv[0]))
+        if alias:
+            argv.insert(0, alias)
         if argv:
             argv[0] = expand_subcommand(argv[0], parser.subcommands)
+        if argv[:1] and argv[0] in HOST_POSITIONAL:
+            argv = extract_host_positional(argv, parser)
         shell_command = []
         if argv[:1] == ["shell"] and "--" in argv:
             split = argv.index("--")

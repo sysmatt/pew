@@ -28,6 +28,10 @@ SCRIPTS=(
     10_connection_vars.sh
     11_shell.sh
     12_subcommand_prefix.sh
+    13_prog_aliases.sh
+    14_shell_munge_username.sh
+    15_host_positional.sh
+    16_no_match_suggestions.sh
 )
 $SKIP_STRESS || SCRIPTS+=(stress_10.sh)
 
