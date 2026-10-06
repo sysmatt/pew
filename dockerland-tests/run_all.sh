@@ -25,6 +25,9 @@ SCRIPTS=(
     07_facts.sh
     08_remote_user_root.sh
     09_pewrc_and_env.sh
+    10_connection_vars.sh
+    11_shell.sh
+    12_subcommand_prefix.sh
 )
 $SKIP_STRESS || SCRIPTS+=(stress_10.sh)
 

@@ -19,8 +19,9 @@ anything still depending on it.
 ## Requirements
 
 - Python 3.10+ (already on any current Debian/Ubuntu/Raspberry Pi OS box)
-- `ansible-core` (for the `ansible` command — used only to resolve host
-  patterns; `pew` never reads inventory files itself)
+- `ansible-core` (for the `ansible` command — used to resolve host
+  patterns and render each host's connection variables; `pew` never
+  reads inventory files itself)
 - `ssh` / `scp` / `rsync` / `diff` on `PATH`, with whatever host-key/
   agent/config setup you already use to reach these systems manually
   (`rsync` is used for `copy`'s file transfer; `scp` is only used for
@@ -133,7 +134,7 @@ to remember `--inventory` on every invocation.
 Pass `--pewrc PATH` (or set `$PEW_PEWRC`; `--pewrc` wins if both are
 set) to use a different rc file entirely — it replaces `~/.pewrc` for
 every setting on this page (`inventory=`, `ansible_config=`,
-`hosts_default=`, `timestamp_format=`). Useful for per-project config,
+`hosts_default=`, `timestamp_format=`, `extra_vars=`). Useful for per-project config,
 or for testing.
 
 ### What about the rest of `ansible.cfg`?
@@ -171,18 +172,76 @@ always wins and `~/.pewrc` is left alone.
 > output ends up (screen recordings, shared sessions, shell scrollback
 > capture/logging, CI job output, etc).
 
-## Remote user
+## How pew connects to each host
 
-Ansible resolves `ansible_user` per host from inventory when it
-connects. `pew` doesn't — it only ever asks Ansible for bare hostnames
-(`ansible ... --list-hosts`), never host variables, so it has no idea
-what user Ansible would have used. Plain `ssh`/`scp`/`rsync` just fall
-back to your local username, which is frequently not what you want.
+`pew` dials each host the way Ansible would. It renders a handful of
+Ansible connection variables per host — through Ansible itself, with a
+local `ansible -m debug` call that opens no SSH connections — and builds
+the `ssh`/`scp`/`rsync` command from them:
 
-`--remote-user`/`-U USER` (available on all five subcommands, including
+| Variable | Becomes |
+|---|---|
+| `ansible_host` | the address dialed (default: the inventory name) |
+| `ansible_user` | `user@` (default: your ssh config / local username) |
+| `ansible_port` | `-o Port=N` |
+| `ansible_ssh_private_key_file` | `-i KEY` |
+| `ansible_ssh_common_args` | appended to `ssh`, `scp`, and `rsync`'s ssh |
+| `ansible_ssh_extra_args` | appended to `ssh` and `rsync`'s ssh (not `scp`, same as Ansible) |
+
+Because Ansible does the rendering, templated values work exactly as
+they do in a playbook — `group_vars` logic, `-e` overrides and all. So
+an inventory that switches connection paths with a toggle:
+
+```yaml
+# group_vars/all.yml
+connect_via_tailnet: false
+ansible_host: >-
+  {{ (inventory_hostname.split('.')[0]) ~ '.ts.example.com'
+     if (connect_via_tailnet | bool) else inventory_hostname }}
+ansible_ssh_common_args: "-o HostKeyAlias={{ inventory_hostname }}"
+```
+
+is followed by `pew` the same way `ansible-playbook` follows it:
+
+```sh
+$ pew run --hosts web1.example.com -n -- uptime
+web1.example.com: ssh -o HostKeyAlias=web1.example.com web1.example.com uptime
+
+$ pew run --hosts web1.example.com -n -e connect_via_tailnet=true -- uptime
+web1.example.com: ssh -o HostKeyAlias=web1.example.com web1.ts.example.com uptime
+```
+
+A host's *identity* is always its inventory name — only the address
+dialed changes. The output label, `{}` substitution, `--log-prefix`
+file names and `--hosts` patterns all use the inventory name.
+
+If a host's variables fail to render (e.g. an undefined variable in its
+`ansible_host` template), `pew` warns and falls back to dialing its
+inventory name directly with no extra options.
+
+`ansible_connection` is not consulted — `pew` always uses ssh.
+
+### Extra vars: `-e` and `extra_vars=`
+
+`--extra-vars`/`-e VARS` (repeatable, on every subcommand) is passed
+through to every `ansible` call `pew` makes — connection rendering and
+`--where` fact-gathering. To make one the default, set it in `~/.pewrc`:
+
+```
+extra_vars=connect_via_tailnet=true
+```
+
+`extra_vars=` goes first and any `-e` flags after it, so the command
+line wins (`-e connect_via_tailnet=false` overrides the line above).
+Multiple vars go on one line, space-separated, same as Ansible's own
+`-e 'a=1 b=2'`.
+
+### Remote user
+
+`--remote-user`/`-U USER` (available on all six subcommands, including
 `list`/`facts` — since `--where`'s fact-gathering opens SSH connections of its
-own, even `list --where` needs this) sets one user for every matched
-host in the invocation:
+own, even `list --where` needs this) overrides `ansible_user` with one
+user for every matched host in the invocation:
 
 ```sh
 pew run --hosts webservers --remote-user deploy -- systemctl status app
@@ -191,12 +250,10 @@ pew run --hosts webservers --remote-user deploy -- systemctl status app
 `--root` is shorthand for `--remote-user root`. The two are mutually
 exclusive — passing both is an error rather than one silently winning.
 
-The confirm-loop prompt and `--dry-run` output always show the actual
-connection spec being used (e.g. `ssh root@web1 ...`), so you can see
-exactly which user you're about to act as before anything runs. The
-hostname *label* on each line of real output (the aligned `host:`
-column, log-file names) always stays the bare hostname regardless —
-only the connection itself changes.
+The confirm-loop prompt and `--dry-run` output always show the full
+connection command being used (e.g. `ssh -o Port=2222 root@10.0.0.5 ...`),
+so you can see exactly where and as whom you're about to act before
+anything runs.
 
 ## Targeting by fact or variable — `--where`
 
@@ -271,7 +328,7 @@ needed to answer that particular question.
 
 ## Verbose and debug output
 
-Available on all five subcommands, both writing to stderr so they
+Available on all six subcommands, both writing to stderr so they
 never mix into piped/redirected stdout:
 
 - `--verbose`/`-v` — high-level narration of what `pew` is doing:
@@ -304,6 +361,14 @@ web2
 Silent by default — neither flag adds any output unless passed.
 
 ## Subcommands
+
+Any unique prefix of a subcommand works in place of its full name:
+`pew r` / `pew ru` is `pew run`, `pew s` / `pew sh` is `pew shell`,
+`pew l` is `pew list`, and so on. An exact name always wins, and a
+prefix matching more than one subcommand is an error that names the
+candidates — never a guess. Since a future subcommand can make today's
+short prefix ambiguous (a `sync` would turn `s` into an error), **use
+full names in scripts**; prefixes are for typing.
 
 ### `pew list` — see who a `--hosts` pattern resolves to
 
@@ -607,9 +672,66 @@ Differences found is normal output, not a failure — `pew diff` only
 reports a host as failed if it couldn't actually fetch the file (e.g.
 permissions, file missing, host unreachable).
 
+### `pew shell` — interactive ssh to exactly one host
+
+```sh
+pew shell alpha                      # login shell on alpha.example.com
+pew shell alpha -e connect_via_tailnet=true
+pew shell alpha --root -- htop       # run one command, with a TTY
+pew shell -l 'web:&staging' --where ansible_hostname=web3
+```
+
+`shell` connects the same way every other subcommand does (see **How
+pew connects to each host**), then hands your terminal over to `ssh`
+completely — `pew` replaces itself with the `ssh` process, so job
+control, window resizing and Ctrl-C behave exactly as with plain `ssh`,
+and `ssh`'s exit code is `pew`'s exit code.
+
+The host is given as a positional `HOST` or with `--hosts`/`-l` (not
+both), and is an ordinary Ansible pattern — but after `--where`
+filtering it must resolve to **exactly one** host. Otherwise `pew`
+aborts and lists what it matched:
+
+```
+$ pew shell web
+pew: error: 'web' matched 3 hosts; shell needs exactly one:
+  web1.example.com
+  web2.example.com
+  web3.example.com
+narrow the pattern (or use --where) to a single host
+```
+
+**Short names and substrings:** a plain name that matches nothing as an
+Ansible pattern falls back to two looser matches against every
+inventory host, most specific first:
+
+1. **Short name** — `pew shell web1` finds `web1.example.com`.
+2. **Substring**, case-insensitive — `pew shell qth0` finds
+   `qth0-router.example.com`.
+
+The first of these that matches anything decides — so `web1` still
+finds `web1.example.com` even though `web10.example.com` also contains
+`web1`. `pew` says what it picked on stderr
+(`pew: web1 → web1.example.com`), and if the deciding match is
+ambiguous (say `pew shell router` with several routers), it aborts and
+lists them, same as above. These matches are on host names only, never
+group names. Only plain names (letters, digits, `.`, `-`, `_`) get the
+fallback — a pattern with any Ansible pattern syntax (`*`, `:`, `,`,
+...) is taken as written. And
+unlike `run`/`copy`/`diff`, `shell` never falls back to `~/.pewrc`'s
+`hosts_default=`; it always needs a host named explicitly.
+
+Anything after `--` runs as a single command with a TTY (`ssh -t`)
+instead of a login shell — the interactive one-host case `run` can't
+cover, since `run` captures output. `{}` is the hostname placeholder,
+as with `run`. A command *without* `--` is an error rather than a guess.
+
+`--dry-run`/`-n` prints the `ssh` command instead of running it — handy
+for pasting somewhere else.
+
 ## Dry run
 
-`--dry-run`/`-n` is available on `run`, `copy`, and `diff` (not `list`
+`--dry-run`/`-n` is available on `run`, `copy`, `diff`, and `shell` (not `list`
 or `facts` — both already just read and print, with nothing to preview;
 neither ever changes anything). It prints the exact command(s) that would run on each host,
 in the same layout your real output would use — respecting `--quiet`/

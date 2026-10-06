@@ -158,7 +158,7 @@ def apply_ansible_config():
     os.environ["ANSIBLE_CONFIG"] = config_path
 
 
-def resolve_hosts(pattern, inventory=None, sort=False):
+def resolve_hosts(pattern, inventory=None, sort=False, allow_empty=False):
     inventory = determine_inventory(inventory)
     info(f"resolving hosts for pattern {pattern!r}"
          + (f" (inventory: {inventory})" if inventory else ""))
@@ -180,6 +180,8 @@ def resolve_hosts(pattern, inventory=None, sort=False):
         if line.strip() and not line.lstrip().startswith("hosts (")
     ]
     if not hosts:
+        if allow_empty:
+            return []
         die(f"host pattern {pattern!r} matched no hosts")
     hosts = sorted(hosts) if sort else hosts
     info(f"resolved {len(hosts)} host(s)")
@@ -318,7 +320,7 @@ def flatten(data, prefix=""):
 # absent from the returned dict if its JSON has no ansible_facts key (or
 # didn't match at all).
 ANSIBLE_RESULT_MARKER_RE = re.compile(
-    r"^(?P<host>\S+) \| \S+(?: \| rc=\d+)? => ", re.MULTILINE,
+    r"^(?P<host>\S+) \| (?P<status>\S+)(?: \| rc=\d+)? => ", re.MULTILINE,
 )
 
 
@@ -341,6 +343,7 @@ def gather_facts(hosts, keys, opts):
     user = effective_remote_user(opts)
     if user:
         cmd += ["-u", user]
+    cmd += extra_vars_args(opts)
     debug_cmd(cmd)
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -543,16 +546,127 @@ def effective_remote_user(opts):
     return "root" if opts.root else opts.remote_user
 
 
-def remote_spec(host, opts):
-    """Build the ssh/scp/rsync connection target for a host.
+def determine_extra_vars(cli_extra_vars):
+    """~/.pewrc [extra_vars=] first, then each --extra-vars/-e in order, so
+    a command-line value wins (Ansible applies repeated -e left to right)."""
+    extra_vars = []
+    from_rc = load_pewrc().get("extra_vars")
+    if from_rc:
+        debug(f"extra vars from {PEWRC_PATH}: {from_rc}")
+        extra_vars.append(from_rc)
+    extra_vars += cli_extra_vars or []
+    return extra_vars
 
-    Ansible resolves ansible_user per host from inventory; pew only ever
-    asks ansible for bare hostnames (`ansible ... --list-hosts`), so it has
-    no per-host user data of its own. --remote-user/--root apply one user
-    uniformly across the whole invocation instead.
+
+def extra_vars_args(opts):
+    return [a for ev in opts.extra_vars for a in ("-e", ev)]
+
+
+# Ansible connection variables pew honors, as the Jinja expression rendered
+# for each. Rendered by Ansible itself (not read raw from ansible-inventory,
+# which returns templated values like ansible_host unrendered), so group_vars
+# logic such as `ansible_host: "{{ ... if connect_via_tailnet ... }}"` and
+# -e overrides resolve exactly as they would for a playbook.
+CONNECTION_VARS = {
+    "address": "ansible_host | default(inventory_hostname)",
+    "port": "ansible_port | default('')",
+    "user": "ansible_user | default('')",
+    "key": "ansible_ssh_private_key_file | default('')",
+    "common_args": "ansible_ssh_common_args | default('')",
+    "extra_args": "ansible_ssh_extra_args | default('')",
+}
+
+
+def resolve_connections(hosts, opts):
+    """Returns {host: {address, port, user, key, common_args, extra_args}}
+    rendered per host via a local `ansible -m debug` (no SSH connection).
+
+    A host whose variables fail to render (e.g. an undefined variable in
+    its ansible_host template) is warned about and falls back to dialing
+    its inventory name directly, with no extra options.
     """
-    user = effective_remote_user(opts)
-    return f"{user}@{host}" if user else host
+    inventory = determine_inventory(opts.inventory)
+    info(f"resolving connection variables for {len(hosts)} host(s)")
+    template = ("{{ {"
+                + ", ".join(f"'{k}': {expr}" for k, expr in CONNECTION_VARS.items())
+                + "} | to_json }}")
+    cmd = ["ansible", ",".join(hosts), "-m", "debug", "-a", f'msg="{template}"']
+    if inventory:
+        cmd += ["-i", inventory]
+    cmd += extra_vars_args(opts)
+    debug_cmd(cmd)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        die("'ansible' not found on PATH. Is ansible-core installed?")
+    debug_block("ansible -m debug stdout", proc.stdout)
+    debug_block("ansible -m debug stderr", proc.stderr)
+
+    decoder = json.JSONDecoder()
+    connections = {}
+    errors = {}
+    for m in ANSIBLE_RESULT_MARKER_RE.finditer(proc.stdout):
+        host = m.group("host")
+        try:
+            data, _ = decoder.raw_decode(proc.stdout, m.end())
+        except json.JSONDecodeError:
+            continue
+        msg = data.get("msg")
+        if m.group("status") != "SUCCESS" or msg is None:
+            errors[host] = msg
+            continue
+        try:
+            conn = json.loads(msg) if isinstance(msg, str) else msg
+        except json.JSONDecodeError:
+            errors[host] = f"unparseable result: {msg!r}"
+            continue
+        connections[host] = {k: "" if v is None else str(v) for k, v in conn.items()}
+
+    for host in hosts:
+        if host not in connections:
+            warn(f"{host}: could not render connection variables, dialing "
+                 f"inventory name directly: {errors.get(host) or 'no result from ansible'}")
+            connections[host] = {"address": host}
+    debug_json("connections", connections)
+    return connections
+
+
+def host_connection(host, opts):
+    connections = getattr(opts, "connections", None) or {}
+    return connections.get(host) or {"address": host}
+
+
+def remote_spec(host, opts):
+    """Build the ssh/scp/rsync connection target for a host: its rendered
+    ansible_host as [user@]address. --remote-user/--root override
+    ansible_user uniformly across the whole invocation.
+    """
+    conn = host_connection(host, opts)
+    user = effective_remote_user(opts) or conn.get("user")
+    address = conn.get("address") or host
+    return f"{user}@{address}" if user else address
+
+
+def ssh_options(host, opts, tool="ssh"):
+    """ssh/scp options from a host's rendered Ansible connection variables.
+    Port goes in as -o Port= since ssh and scp spell the flag differently
+    (-p vs -P). Like Ansible, ansible_ssh_extra_args applies to ssh only
+    (rsync's transport counts as ssh), not scp."""
+    conn = host_connection(host, opts)
+    options = []
+    if conn.get("port"):
+        options += ["-o", f"Port={conn['port']}"]
+    if conn.get("key"):
+        options += ["-i", os.path.expanduser(conn["key"])]
+    options += shlex.split(conn.get("common_args") or "")
+    if tool == "ssh":
+        options += shlex.split(conn.get("extra_args") or "")
+    return options
+
+
+def ssh_argv(host, opts):
+    return ["ssh"] + ssh_options(host, opts) + [remote_spec(host, opts)]
 
 
 # ---------------------------------------------------------------------------
@@ -564,7 +678,7 @@ def substitute(args, host):
 
 
 def run_host(host, args, opts):
-    argv = ["ssh", remote_spec(host, opts)] + substitute(args, host)
+    argv = ssh_argv(host, opts) + substitute(args, host)
     debug_cmd(argv)
     try:
         proc = subprocess.run(
@@ -589,7 +703,7 @@ def run_host_streaming(host, args, opts, on_line):
     pipe, which ends the `for line in proc.stdout` loop naturally even if
     the command was still silent (never having produced a line at all).
     """
-    argv = ["ssh", remote_spec(host, opts)] + substitute(args, host)
+    argv = ssh_argv(host, opts) + substitute(args, host)
     debug_cmd(argv)
     try:
         proc = subprocess.Popen(
@@ -755,7 +869,7 @@ def emit(host, output, quiet, multiline, log_prefix, width=0, opts=None):
 
 
 def run_cmdline(host, args, opts):
-    return "ssh " + remote_spec(host, opts) + " " + shlex.join(substitute(args, host))
+    return shlex.join(ssh_argv(host, opts) + substitute(args, host))
 
 
 def do_run(hosts, args, opts):
@@ -844,7 +958,7 @@ def fixup_ownership(host, target, local_file, opts):
         f"chmod {mode:o} {q}; CHMOD_RC=$?; "
         f"echo PEW_FIXUP CHOWN_RC=$CHOWN_RC CHMOD_RC=$CHMOD_RC"
     )
-    fixup_argv = ["ssh", remote_spec(host, opts), remote_script]
+    fixup_argv = ssh_argv(host, opts) + [remote_script]
     debug_cmd(fixup_argv)
     proc = subprocess.run(fixup_argv, capture_output=True, text=True)
     chown_rc = None
@@ -883,30 +997,31 @@ def build_copy_targets(local_files, remote_path, same):
     ]
 
 
-def rsync_argv(lf, spec, target, opts):
+def rsync_argv(host, lf, target, opts):
     argv = ["rsync"]
     if opts.verbose or opts.debug:
         argv.append("-v")
-    argv += [lf, f"{spec}:{target}"]
+    options = ssh_options(host, opts)
+    if options:
+        argv += ["-e", shlex.join(["ssh"] + options)]
+    argv += [lf, f"{remote_spec(host, opts)}:{target}"]
     return argv
 
 
 def plan_copy(host, targets, opts):
-    spec = remote_spec(host, opts)
     lines = []
     for lf, target in targets:
-        lines.append(shlex.join(rsync_argv(lf, spec, target, opts)))
+        lines.append(shlex.join(rsync_argv(host, lf, target, opts)))
         owner, group, mode = effective_owner_group_mode(lf, opts)
         fixup = f"chown {owner}:{group} {target}; chmod {mode:o} {target}"
-        lines.append(shlex.join(["ssh", spec, fixup]))
+        lines.append(shlex.join(ssh_argv(host, opts) + [fixup]))
     return "\n".join(lines)
 
 
 def copy_host(host, targets, opts):
-    spec = remote_spec(host, opts)
     output_parts = []
     for lf, target in targets:
-        argv = rsync_argv(lf, spec, target, opts)
+        argv = rsync_argv(host, lf, target, opts)
         debug_cmd(argv)
         proc = subprocess.run(argv, capture_output=True, text=True)
         if proc.returncode != 0:
@@ -976,10 +1091,14 @@ def do_copy(hosts, targets, opts):
 # diff
 # ---------------------------------------------------------------------------
 
+def scp_argv(host, src, dst, opts):
+    return ["scp"] + ssh_options(host, opts, tool="scp") + [src, dst]
+
+
 def plan_diff(host, local_file, opts):
     spec = remote_spec(host, opts)
     lines = [
-        shlex.join(["scp", f"{spec}:{local_file}", "<tmpfile>"]),
+        shlex.join(scp_argv(host, f"{spec}:{local_file}", "<tmpfile>", opts)),
         shlex.join(["diff", "-u", local_file, "<tmpfile>"]),
     ]
     return "\n".join(lines)
@@ -990,9 +1109,9 @@ def diff_host(host, local_file, opts):
     fd, tmp_path = tempfile.mkstemp(prefix="pew-diff-")
     os.close(fd)
     try:
-        scp_argv = ["scp", f"{spec}:{local_file}", tmp_path]
-        debug_cmd(scp_argv)
-        scp_proc = subprocess.run(scp_argv, capture_output=True, text=True)
+        argv = scp_argv(host, f"{spec}:{local_file}", tmp_path, opts)
+        debug_cmd(argv)
+        scp_proc = subprocess.run(argv, capture_output=True, text=True)
         if scp_proc.returncode != 0:
             return 2, (scp_proc.stdout + scp_proc.stderr).strip()
 
@@ -1041,6 +1160,79 @@ def do_diff(hosts, local_file, opts):
 
 
 # ---------------------------------------------------------------------------
+# shell
+# ---------------------------------------------------------------------------
+
+PLAIN_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def match_plain_name(name, inventory):
+    """Hosts a plain name (no pattern syntax) refers to, most specific
+    first: short name (`alpha` -> alpha.example.com, the same convention
+    as `inventory_hostname.split('.')[0]`), else case-insensitive
+    substring (`qth0` -> qth0-router.example.com). The first stage with
+    any match wins, so a short-name hit is never made ambiguous by
+    substring hits.
+
+    Matched in Python against every inventory host rather than with an
+    Ansible glob like `*NAME*`, which would match group names too and
+    could silently select a group's hosts that don't contain NAME.
+    """
+    all_hosts = resolve_hosts("all", inventory, sort=True, allow_empty=True)
+    needle = name.lower()
+    short = [h for h in all_hosts if h.lower().startswith(needle + ".")]
+    if short:
+        info(f"{name!r} matched {len(short)} host(s) as a short name")
+        return short
+    substring = [h for h in all_hosts if needle in h.lower()]
+    info(f"{name!r} matched {len(substring)} host(s) as a substring")
+    return substring
+
+
+def resolve_shell_host(pattern, opts):
+    """Resolve pattern (plus --where) to exactly one host, or die.
+
+    A plain name that matches nothing as an Ansible pattern falls back to
+    match_plain_name(); anything with pattern syntax is taken as written.
+    """
+    hosts = resolve_hosts(pattern, opts.inventory, sort=True, allow_empty=True)
+    fuzzy = False
+    if not hosts and PLAIN_NAME_RE.match(pattern):
+        hosts = match_plain_name(pattern, opts.inventory)
+        fuzzy = True
+    if not hosts:
+        die(f"host pattern {pattern!r} matched no hosts")
+    if opts.where:
+        hosts = filter_by_where(hosts, opts.where, opts)
+    if len(hosts) != 1:
+        listing = "\n".join(f"  {h}" for h in hosts)
+        die(f"{pattern!r} matched {len(hosts)} hosts; shell needs exactly one:\n"
+            f"{listing}\nnarrow the pattern (or use --where) to a single host")
+    if fuzzy:
+        print(f"{PROG}: {pattern} → {hosts[0]}", file=sys.stderr)
+    return hosts[0]
+
+
+def do_shell(host, command, opts):
+    """Replace this process with ssh to host, so ssh owns the terminal,
+    signals, and exit code outright. With a command, -t forces a TTY for
+    it (the thing `run`, which captures output, can't give you)."""
+    argv = ssh_argv(host, opts)
+    if command:
+        argv = argv[:1] + ["-t"] + argv[1:] + substitute(command, host)
+    if opts.dry_run:
+        print(shlex.join(argv))
+        return 0
+    debug_cmd(argv)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        os.execvp(argv[0], argv)
+    except FileNotFoundError:
+        die("ssh not found on PATH")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1071,8 +1263,16 @@ def build_parser():
     filter_parent.add_argument(
         "--pewrc", metavar="PATH",
         help="Use PATH instead of ~/.pewrc for inventory=/ansible_config=/"
-             "hosts_default=/timestamp_format= overrides. Same as "
+             "hosts_default=/timestamp_format=/extra_vars= overrides. Same as "
              "$PEW_PEWRC, which this takes precedence over.",
+    )
+    filter_parent.add_argument(
+        "--extra-vars", "-e", action="append", metavar="VARS",
+        help="Pass through to every ansible call as -e VARS (repeatable), "
+             "e.g. -e connect_via_tailnet=true. Affects how inventory "
+             "connection variables like ansible_host render, and --where "
+             "fact-gathering. Appended after ~/.pewrc's extra_vars=, so "
+             "these win.",
     )
     filter_parent.add_argument(
         "--sort", "-r", action="store_true", help="Sort hosts before processing",
@@ -1104,9 +1304,9 @@ def build_parser():
     user_group = filter_parent.add_mutually_exclusive_group()
     user_group.add_argument(
         "--remote-user", "-U", metavar="USER", default=None,
-        help="SSH/SCP/rsync as USER instead of your local username. Applies to "
-             "every matched host and to --where's fact-gathering — pew does "
-             "not read ansible_user from inventory.",
+        help="SSH/SCP/rsync as USER instead of each host's ansible_user "
+             "(or your local username if it has none). Applies to every "
+             "matched host and to --where's fact-gathering.",
     )
     user_group.add_argument(
         "--root", action="store_true",
@@ -1256,14 +1456,59 @@ def build_parser():
              "Repeatable (AND-ed together, and with --match/--match-keys).",
     )
 
+    shell_p = sub.add_parser("shell", parents=[filter_parent],
+                              usage="%(prog)s [options] HOST [-- COMMAND...]",
+                              help="Open an interactive ssh session to exactly one host",
+                              epilog="Anything after -- is run with a TTY (ssh -t) "
+                                     "instead of a login shell; {} is the hostname "
+                                     "placeholder.")
+    shell_p.add_argument(
+        "--dry-run", "-n", action="store_true",
+        help="Print the ssh command instead of running it",
+    )
+    shell_p.add_argument(
+        "target", nargs="?", metavar="HOST",
+        help="Ansible host pattern that must resolve to exactly one host "
+             "(same as --hosts). A plain name matching nothing falls back to "
+             "a short-name match (alpha -> alpha.example.com), then a "
+             "case-insensitive substring match (qth0 -> qth0-router.example.com).",
+    )
+    p.subcommands = list(sub.choices)
     return p
+
+
+def expand_subcommand(word, names):
+    """Expand a unique prefix of a subcommand name (`r` -> run, `sh` ->
+    shell). An exact name always wins; an ambiguous prefix is an error,
+    never a guess. Anything else (options like -h, unknown words) is
+    returned as-is for argparse to handle."""
+    if not word or word in names or word.startswith("-"):
+        return word
+    candidates = [n for n in names if n.startswith(word)]
+    if len(candidates) > 1:
+        die(f"subcommand {word!r} is ambiguous: {', '.join(sorted(candidates))}")
+    if candidates:
+        debug(f"subcommand {word!r} expanded to {candidates[0]!r}")
+        return candidates[0]
+    return word
 
 
 def main():
     global VERBOSE, DEBUG, PEWRC_PATH
     try:
         parser = build_parser()
-        opts = parser.parse_args()
+        # shell's command is split off at the first -- before argparse sees
+        # it: a REMAINDER positional after HOST would swallow any options
+        # given after HOST (`pew shell web1 --root -- sudo -i`). The
+        # subcommand is always argv[0], the top-level parser has no options.
+        argv = sys.argv[1:]
+        if argv:
+            argv[0] = expand_subcommand(argv[0], parser.subcommands)
+        shell_command = []
+        if argv[:1] == ["shell"] and "--" in argv:
+            split = argv.index("--")
+            argv, shell_command = argv[:split], argv[split + 1:]
+        opts = parser.parse_args(argv)
         VERBOSE = opts.verbose
         DEBUG = opts.debug
         pewrc_override = determine_pewrc_path(opts.pewrc)
@@ -1272,6 +1517,19 @@ def main():
                 warn(f"--pewrc/$PEW_PEWRC path does not exist: {pewrc_override}")
             PEWRC_PATH = pewrc_override
         apply_ansible_config()
+        opts.extra_vars = determine_extra_vars(opts.extra_vars)
+
+        if opts.action == "shell":
+            # No hosts_default= fallback: a shell names its target explicitly.
+            if opts.target and opts.hosts:
+                die("give the host either as HOST or --hosts/-l, not both")
+            pattern = opts.target or opts.hosts
+            if not pattern:
+                die("shell needs a HOST (or --hosts/-l)")
+            host = resolve_shell_host(pattern, opts)
+            opts.connections = resolve_connections([host], opts)
+            return do_shell(host, shell_command, opts)
+
         opts.hosts = determine_hosts(opts.hosts)
 
         hosts = resolve_hosts(opts.hosts, opts.inventory, opts.sort)
@@ -1286,6 +1544,8 @@ def main():
         if opts.action == "facts":
             unreachable = do_facts(hosts, opts)
             return 1 if unreachable else 0
+
+        opts.connections = resolve_connections(hosts, opts)
 
         if opts.action == "run":
             command = opts.command
