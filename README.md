@@ -449,6 +449,24 @@ isn't set either.
 Prints one hostname per line — pipe it into `xargs`, a `for` loop,
 whatever.
 
+### `pew groups` — see every group and its hosts
+
+```sh
+$ pew groups
+database  : db1.example.com
+prod      : db1.example.com web1.example.com web2.example.com
+routers   : alpha-rtr.example.com qth0-router.example.com
+web       : web1.example.com web2.example.com
+```
+
+One line per inventory group, sorted, hosts sorted within each. A
+group's hosts include those of its child groups (`prod` above is
+`[prod:children] web database`), so each line is exactly what that group
+name resolves to as HOST. `all` is left out; `ungrouped` appears only if
+some host is in no other group. Takes no HOST — it describes the whole
+inventory (`-i`/`--pewrc` still apply). Ansible itself drops groups with
+no hosts, so they don't appear.
+
 ### `pew facts` — explore facts and inventory variables
 
 ```sh

@@ -271,6 +271,35 @@ def no_match_message(pattern, inventory):
     return msg
 
 
+def group_members(data, group, seen=None):
+    """Every host in group, its child groups' included (recursively), the
+    same set `ansible GROUP --list-hosts` resolves to."""
+    seen = set() if seen is None else seen
+    if group in seen or not isinstance(data.get(group), dict):
+        return set()
+    seen.add(group)
+    hosts = set(data[group].get("hosts", []))
+    for child in data[group].get("children", []):
+        hosts |= group_members(data, child, seen)
+    return hosts
+
+
+def do_groups(opts):
+    """One line per inventory group: `group : host host ...`. `all` is
+    left out (it's everything), and `ungrouped` unless it has hosts."""
+    data = load_inventory_json(opts.inventory)
+    if not data:
+        die("could not read inventory (rerun with --debug to see ansible-inventory's output)")
+    groups = {g: sorted(group_members(data, g))
+              for g in data if g not in ("_meta", "all")}
+    if not groups.get("ungrouped"):
+        groups.pop("ungrouped", None)
+    width = label_width(groups)
+    for g in sorted(groups):
+        print(f"{g:<{width}} : {' '.join(groups[g])}".rstrip())
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Fact-based filtering (--where)
 # ---------------------------------------------------------------------------
@@ -1345,21 +1374,34 @@ def build_parser():
     # Host-selection flags: identical across every subcommand, including
     # `list`, so a --hosts value can be copy-pasted from one to another and
     # you can trust it resolves to exactly the same set of systems.
-    filter_parent = argparse.ArgumentParser(add_help=False)
-    filter_parent.add_argument(
-        "--hosts", "-l", metavar="PATTERN",
-        help="Ansible host pattern, e.g. webservers, 'web:&staging', host1,host2 "
-             "(default: ~/.pewrc's hosts_default=, if set)",
-    )
-    filter_parent.add_argument(
+    # Inventory-only flags, shared by everything including `groups`, which
+    # reads the inventory but never resolves a host pattern.
+    inventory_parent = argparse.ArgumentParser(add_help=False)
+    inventory_parent.add_argument(
         "--inventory", "-i", metavar="PATH",
         help="Ansible inventory path (default: whatever ansible resolves itself)",
     )
-    filter_parent.add_argument(
+    inventory_parent.add_argument(
         "--pewrc", metavar="PATH",
         help="Use PATH instead of ~/.pewrc for inventory=/ansible_config=/"
              "hosts_default=/timestamp_format=/extra_vars= overrides. Same as "
              "$PEW_PEWRC, which this takes precedence over.",
+    )
+    inventory_parent.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Print informational messages about what pew is doing, to stderr",
+    )
+    inventory_parent.add_argument(
+        "--debug", "-d", action="store_true",
+        help="Like --verbose, plus raw data: exact commands run and "
+             "pretty-printed --where fact-gathering output, to stderr",
+    )
+
+    filter_parent = argparse.ArgumentParser(add_help=False, parents=[inventory_parent])
+    filter_parent.add_argument(
+        "--hosts", "-l", metavar="PATTERN",
+        help="Ansible host pattern, e.g. webservers, 'web:&staging', host1,host2 "
+             "(default: ~/.pewrc's hosts_default=, if set)",
     )
     filter_parent.add_argument(
         "--extra-vars", "-e", action="append", metavar="VARS",
@@ -1384,15 +1426,6 @@ def build_parser():
              "Repeatable (AND-ed together). Gathers facts fresh for the "
              "matched candidates (or reuses Ansible's own fact cache if "
              "fact_caching is configured).",
-    )
-    filter_parent.add_argument(
-        "--verbose", "-v", action="store_true",
-        help="Print informational messages about what pew is doing, to stderr",
-    )
-    filter_parent.add_argument(
-        "--debug", "-d", action="store_true",
-        help="Like --verbose, plus raw data: exact commands run and "
-             "pretty-printed --where fact-gathering output, to stderr",
     )
     # --remote-user/--root live here (not host_parent) because --where's fact
     # gathering opens SSH connections too, so even `list` needs this.
@@ -1539,6 +1572,10 @@ def build_parser():
                     usage="%(prog)s [options] [HOST]",
                     epilog=HOST_EPILOG,
                     help="Resolve and print hosts matching HOST/--hosts")
+
+    sub.add_parser("groups", parents=[inventory_parent],
+                    usage="%(prog)s [options]",
+                    help="List every inventory group and the hosts it contains")
 
     facts_p = sub.add_parser("facts", parents=[filter_parent],
                               usage="%(prog)s [options] [HOST]",
@@ -1697,6 +1734,10 @@ def main():
                 warn(f"--pewrc/$PEW_PEWRC path does not exist: {pewrc_override}")
             PEWRC_PATH = pewrc_override
         apply_ansible_config()
+
+        if opts.action == "groups":
+            return do_groups(opts)
+
         opts.extra_vars = determine_extra_vars(opts.extra_vars)
 
         if opts.action == "shell":
