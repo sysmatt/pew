@@ -33,6 +33,7 @@ SCRIPTS=(
     15_host_positional.sh
     16_no_match_suggestions.sh
     17_groups.sh
+    18_run_color.sh
 )
 $SKIP_STRESS || SCRIPTS+=(stress_10.sh)
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Tests: invoked as `pes` or `per` (a symlink to ./pew, or a pipx entry
-# point), pew acts as `pew shell` / `pew run` - `pes alpha` is
-# `pew shell alpha`. Dispatch is on basename(argv[0]).
+# Tests: invoked as `pes`, `per` or `pez` (a symlink to ./pew, or a pipx
+# entry point), pew acts as `pew shell` / `pew run` / `pew run -P -Z` with
+# soft color - `pes alpha` is `pew shell alpha`. Dispatch is on
+# basename(argv[0]).
 #
 # No containers needed: every check is --dry-run against a static
 # inventory, which resolves hosts and renders the ssh command locally
@@ -18,6 +19,7 @@ trap 'rm -rf "$LOCAL_TMP"' EXIT
 mkdir -p "$FAKE_HOME" "$BIN"
 ln -s "$DT_PEW" "$BIN/pes"
 ln -s "$DT_PEW" "$BIN/per"
+ln -s "$DT_PEW" "$BIN/pez"
 
 INV="$LOCAL_TMP/inventory.ini"
 cat > "$INV" <<'EOF'
@@ -42,5 +44,11 @@ check "pes options after HOST"          '^ssh -t web1\.example\.test htop$'   pe
 check "per -> pew run"                  ': ssh web1\.example\.test uptime$'   per -i "$INV" --hosts web1.example.test -n -- uptime
 check "pes --help is shell's help"      'usage: pew shell'                    pes --help
 check "pes with no HOST errors like shell" 'shell needs a HOST'               pes -i "$INV"
+check "pez -> pew run, no confirm prompt" ': ssh web1\.example\.test uptime$'   pez -i "$INV" web1.example.test -n uptime
+check "pez --help is run's help"        'usage: pew run'                      pez --help
+# -P/-Z are real flags, color is soft: none of these may error out
+check "pez --follow (soft color, no clash)" ': ssh web1\.example\.test uptime$' pez -i "$INV" web1.example.test -n -f uptime
+check "pez --quiet (soft color, no clash)"  '^ssh web1\.example\.test uptime$'  pez -i "$INV" web1.example.test -n -q uptime
+check "pez --no-color (soft color, no clash)" ': ssh web1\.example\.test uptime$' pez -i "$INV" web1.example.test -n --no-color uptime
 
 dt::summary

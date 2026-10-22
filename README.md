@@ -58,13 +58,15 @@ just yourself), add `--global`. This installs to `/opt/pipx` and
 sudo pipx install --global .
 ```
 
-pipx also installs two shortcuts, `pes` (= `pew shell`) and `per`
-(= `pew run`) — see [Shortcuts](#shortcuts-pes-and-per). With the
-symlink install, add them yourself:
+pipx also installs three shortcuts, `pes` (= `pew shell`), `per`
+(= `pew run`) and `pez` (= `pew run -P -Z`, plus color) — see
+[Shortcuts](#shortcuts-pes-per-and-pez). With the symlink install, add
+them yourself:
 
 ```sh
 ln -s "$(pwd)/pew" ~/bin/pes
 ln -s "$(pwd)/pew" ~/bin/per
+ln -s "$(pwd)/pew" ~/bin/pez
 ```
 
 ## Testing against real hosts
@@ -181,7 +183,7 @@ to remember `--inventory` on every invocation.
 Pass `--pewrc PATH` (or set `$PEW_PEWRC`; `--pewrc` wins if both are
 set) to use a different rc file entirely — it replaces `~/.pewrc` for
 every setting on this page (`inventory=`, `ansible_config=`,
-`hosts_default=`, `timestamp_format=`, `extra_vars=`). Useful for per-project config,
+`hosts_default=`, `timestamp_format=`, `extra_vars=`, `color=`). Useful for per-project config,
 or for testing.
 
 ### What about the rest of `ansible.cfg`?
@@ -417,16 +419,24 @@ candidates — never a guess. Since a future subcommand can make today's
 short prefix ambiguous (a `sync` would turn `s` into an error), **use
 full names in scripts**; prefixes are for typing.
 
-### Shortcuts: `pes` and `per`
+### Shortcuts: `pes`, `per` and `pez`
 
 Run under the name `pes`, pew acts as `pew shell`; under `per`, as
-`pew run`. Everything after is passed through unchanged:
+`pew run`. Under `pez` it acts as `pew run --parallel --yes` with
+[`--color`](#--color--hostname-colored-by-exit-status) turned on.
+Everything after is passed through unchanged:
 
 ```sh
 pes alpha                            # pew shell alpha
 pes alpha --root -- htop             # pew shell alpha --root -- htop
 per web uptime                       # pew run web uptime
+pez web uptime                       # pew run -P -Z -C web uptime
 ```
+
+`pez` turns color on the same soft way `color=yes` in `~/.pewrc` does,
+not as a literal `-C`. So `pez web -f ...` and `pez web -q ...` still
+work (just without color), `--no-color` and `$NO_COLOR` turn it off,
+and piped output stays plain.
 
 It's keyed on the name pew was invoked as, so it works the same for the
 pipx entry points and for a symlink to `./pew` (see **Install**).
@@ -561,6 +571,9 @@ pew run --hosts webservers --yes --multiline -- cat /etc/os-release
 
 # No hostname labeling at all, just raw output
 pew run --hosts webservers --yes --quiet -- hostname
+
+# Green hostnames for hosts that exited 0, red for the rest
+pew run --hosts webservers --yes --parallel --color -- systemctl is-active nginx
 ```
 
 `--parallel` always runs without prompting (there's no meaningful way to
@@ -651,6 +664,24 @@ EOF
 `--timestamp` — the whole point of a plain per-host log file is that it
 reads as if you'd run the command directly on that host, and timestamp
 noise on every line works against that.
+
+#### `--color` — hostname colored by exit status
+
+`--color`/`-C` prints each hostname (the `host:` prefix, or the
+`### HOST ###` banner with `--multiline`) in green if that host's
+command exited 0 and red otherwise. The failure summary's hostnames
+turn red as well. Color only appears when stdout is a terminal, so
+piping or redirecting pew's output never puts escape codes in a file.
+
+You can't combine it with `--follow`, because those lines print before
+the exit status is known. You also can't combine it with `--quiet`,
+since quiet output has no hostname to color. Either pairing is an error.
+
+To have it on by default, put `color=yes` in `~/.pewrc`. `--no-color`
+turns it off for a single run, and so does setting `$NO_COLOR`. An
+explicit `--color` still wins over `$NO_COLOR`. The `~/.pewrc` default
+quietly does nothing on `--follow`/`--quiet` runs, so those keep working
+with no color.
 
 ### `pew copy` — push file(s) to each host
 
@@ -858,7 +889,13 @@ web1: ssh web1 uptime ???
 
 `0` if every host succeeded, `1` if any host failed (or, for `run`, if
 the run was stopped early after a failure without `--continue-on-fail`).
-A summary line is printed listing which hosts failed.
+One summary line lists the hosts that failed. For `run`, each one
+shows its exit status in parentheses, with the reason added for a
+timeout. Failures aren't also reported one line per host:
+
+```
+pew: warning: 3/5 host(s) failed: foxtrot.example.com (255), grunt.example.com (255), sierra.example.com (124, timed out after 10.0s)
+```
 
 ## What's deliberately different from the old `mew`
 

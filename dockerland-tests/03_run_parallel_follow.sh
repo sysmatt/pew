@@ -80,12 +80,14 @@ else
 fi
 
 # --- --continue-on-fail: without it, serial run stops after first failure ---
-# (count pew's own "<host> returned 1" warnings rather than command stdout -
-# `false` produces none, and this sidesteps ssh's argv-joining mangling any
-# quoted remote shell metacharacters we'd otherwise need)
+# (read the count off pew's own "N/3 host(s) failed" summary rather than
+# command stdout - `false` produces none, and this sidesteps ssh's
+# argv-joining mangling any quoted remote shell metacharacters we'd
+# otherwise need)
+failed_count() { echo "$1" | sed -nE 's|.* ([0-9]+)/[0-9]+ host\(s\) failed:.*|\1|p'; }
 out="$("$DT_PEW" run "${IARGS[@]}" --yes -- false 2>&1)"
-ran_count=$(echo "$out" | grep -c "returned 1")
-if [ "$ran_count" -eq 1 ]; then
+ran_count=$(failed_count "$out")
+if [ "${ran_count:-0}" -eq 1 ]; then
     dt::pass "without --continue-on-fail, serial run stops after first failure (1 host ran)"
 else
     dt::fail "expected exactly 1 host to run before stopping, got $ran_count. Output: $out"
@@ -93,8 +95,8 @@ fi
 
 # --- --continue-on-fail: with it, all hosts are attempted despite failures ---
 out="$("$DT_PEW" run "${IARGS[@]}" --yes --continue-on-fail -- false 2>&1)"
-ran_count=$(echo "$out" | grep -c "returned 1")
-if [ "$ran_count" -eq 3 ]; then
+ran_count=$(failed_count "$out")
+if [ "${ran_count:-0}" -eq 3 ]; then
     dt::pass "--continue-on-fail runs all 3 hosts despite each one failing"
 else
     dt::fail "expected 3 hosts to run with --continue-on-fail, got $ran_count. Output: $out"

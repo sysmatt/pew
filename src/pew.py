@@ -28,9 +28,13 @@ import threading
 PROG = "pew"
 
 # Installed under one of these names (pipx entry point or a symlink to
-# ./pew), pew behaves as if that subcommand had been typed first:
+# ./pew), pew behaves as if these words had been typed first:
 # `pes alpha` is `pew shell alpha`. Keyed on basename(argv[0]).
-PROG_ALIASES = {"pes": "shell", "per": "run"}
+PROG_ALIASES = {"pes": ["shell"], "per": ["run"], "pez": ["run", "-P", "-Z"]}
+
+# Aliases that also turn --color on, softly: like ~/.pewrc's color=yes
+# rather than a literal -C, so --follow/--quiet/--no-color still work.
+COLOR_ALIASES = {"pez"}
 
 # Subcommands whose first positional is HOST unless --hosts/-l is given
 # (`pew run web uptime`). `-` as HOST means ~/.pewrc's hosts_default=.
@@ -48,6 +52,46 @@ def die(msg, code=1):
 
 def warn(msg):
     print(f"{PROG}: warning: {msg}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# --color: ANSI hostname coloring for `run` (green rc 0, red non-zero).
+# ---------------------------------------------------------------------------
+
+GREEN = "\033[32m"
+RED = "\033[31m"
+RESET = "\033[0m"
+TRUTHY = {"1", "yes", "true", "on"}
+
+
+def paint(text, rc, enabled):
+    if not enabled or rc is None:
+        return text
+    return f"{GREEN if rc == 0 else RED}{text}{RESET}"
+
+
+def determine_color(opts, default=False):
+    """--color/--no-color > $NO_COLOR > ~/.pewrc [color=] or default (a
+    COLOR_ALIASES name) > off. An explicit --color is rejected with
+    --follow/--quiet; a default from ~/.pewrc or the alias is just quietly
+    dropped there, so it doesn't break every --follow run.
+    Either way it then only applies if stdout is actually a terminal."""
+    if opts.color:
+        if opts.follow:
+            die("--color/-C can't be combined with --follow/-f")
+        if opts.quiet:
+            die("--color/-C can't be combined with --quiet/-q")
+        wanted = True
+    elif opts.color is False or "NO_COLOR" in os.environ:
+        wanted = False
+    else:
+        wanted = ((default or load_pewrc().get("color", "").lower() in TRUTHY)
+                  and not opts.follow and not opts.quiet)
+    return wanted and sys.stdout.isatty()
+
+
+def failure_detail(rc, note):
+    return f"{rc}, {note}" if note else str(rc)
 
 
 # ---------------------------------------------------------------------------
@@ -896,7 +940,7 @@ def open_log(log_prefix, host):
 
 
 def do_run_follow_serial(hosts, args, opts, width):
-    failures = []
+    failures = {}
     state = {"yes_all": opts.yes}
     for host in hosts:
         desc = run_cmdline(host, args, opts)
@@ -914,9 +958,7 @@ def do_run_follow_serial(hosts, args, opts, width):
         if log_f:
             log_f.close()
         if rc != 0:
-            failures.append(host)
-            extra = f" ({note})" if note else ""
-            warn(f"{host} returned {rc}{extra}")
+            failures[host] = failure_detail(rc, note)
             if not opts.continue_on_fail:
                 warn("stopping (pass --continue-on-fail/-X to proceed past failures)")
                 break
@@ -935,7 +977,7 @@ def do_run_follow_parallel(hosts, args, opts, width):
         q.put((host, DONE))
         return rc, note
 
-    failures = []
+    failures = {}
     max_workers = opts.jobs if opts.jobs else len(hosts)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
         future_to_host = {ex.submit(worker, h): h for h in hosts}
@@ -953,9 +995,7 @@ def do_run_follow_parallel(hosts, args, opts, width):
             host = future_to_host[fut]
             rc, note = fut.result()
             if rc != 0:
-                failures.append(host)
-                extra = f" ({note})" if note else ""
-                warn(f"{host} returned {rc}{extra}")
+                failures[host] = failure_detail(rc, note)
 
     for f in log_files.values():
         if f:
@@ -963,7 +1003,7 @@ def do_run_follow_parallel(hosts, args, opts, width):
     return failures
 
 
-def emit(host, output, quiet, multiline, log_prefix, width=0, opts=None):
+def emit(host, output, quiet, multiline, log_prefix, width=0, opts=None, rc=None):
     # Log files stay clean on purpose — timestamps (if any) are terminal-only.
     if log_prefix:
         with open(f"{log_prefix}.{host}", "a") as f:
@@ -972,6 +1012,7 @@ def emit(host, output, quiet, multiline, log_prefix, width=0, opts=None):
                 f.write("\n")
 
     ts = timestamp_prefix(opts)
+    color = getattr(opts, "color_out", False)
 
     if quiet:
         for line in output.splitlines():
@@ -979,12 +1020,12 @@ def emit(host, output, quiet, multiline, log_prefix, width=0, opts=None):
         return
 
     if multiline:
-        print(f"{ts}### {host.upper()} ###")
+        print(f"{ts}### {paint(host.upper(), rc, color)} ###")
         for line in output.splitlines():
             print(f"{ts}{line}")
         return
 
-    prefix = f"{host:<{width}}: "
+    prefix = paint(host, rc, color) + " " * (width - len(host)) + ": "
     lines = output.splitlines()
     if not lines:
         print(f"{ts}{prefix}")
@@ -1009,7 +1050,7 @@ def do_run(hosts, args, opts):
             return do_run_follow_parallel(hosts, args, opts, width)
         return do_run_follow_serial(hosts, args, opts, width)
 
-    failures = []
+    failures = {}
 
     if opts.parallel:
         max_workers = opts.jobs if opts.jobs else len(hosts)
@@ -1020,11 +1061,9 @@ def do_run(hosts, args, opts):
             for fut in concurrent.futures.as_completed(future_to_host):
                 host = future_to_host[fut]
                 rc, output, note = fut.result()
-                emit(host, output, opts.quiet, opts.multiline, opts.log_prefix, width, opts)
+                emit(host, output, opts.quiet, opts.multiline, opts.log_prefix, width, opts, rc)
                 if rc != 0:
-                    failures.append(host)
-                    extra = f" ({note})" if note else ""
-                    warn(f"{host} returned {rc}{extra}")
+                    failures[host] = failure_detail(rc, note)
         return failures
 
     state = {"yes_all": opts.yes}
@@ -1034,11 +1073,9 @@ def do_run(hosts, args, opts):
             print(f"*** {host}: SKIPPED ***")
             continue
         rc, output, note = run_host(host, args, opts)
-        emit(host, output, opts.quiet, opts.multiline, opts.log_prefix, width, opts)
+        emit(host, output, opts.quiet, opts.multiline, opts.log_prefix, width, opts, rc)
         if rc != 0:
-            failures.append(host)
-            extra = f" ({note})" if note else ""
-            warn(f"{host} returned {rc}{extra}")
+            failures[host] = failure_detail(rc, note)
             if not opts.continue_on_fail:
                 warn("stopping (pass --continue-on-fail/-X to proceed past failures)")
                 break
@@ -1168,7 +1205,7 @@ def do_copy(hosts, targets, opts):
             emit(host, plan_copy(host, targets, opts), opts.quiet, False, None, width, opts)
         return []
 
-    failures = []
+    failures = {}
 
     def report_success(host, output):
         # rsync is silent on success unless --verbose/--debug added -v, in
@@ -1187,7 +1224,7 @@ def do_copy(hosts, targets, opts):
                 host = future_to_host[fut]
                 rc, result = fut.result()
                 if rc != 0:
-                    failures.append(host)
+                    failures[host] = None
                     warn(f"{host}: rsync failed: {result}")
                 else:
                     report_success(host, result)
@@ -1201,7 +1238,7 @@ def do_copy(hosts, targets, opts):
             continue
         rc, result = copy_host(host, targets, opts)
         if rc != 0:
-            failures.append(host)
+            failures[host] = None
             warn(f"{host}: rsync failed: {result}")
             if not opts.continue_on_fail:
                 warn("stopping (pass --continue-on-fail/-X to proceed past failures)")
@@ -1259,7 +1296,7 @@ def do_diff(hosts, local_file, opts):
             emit(host, plan_diff(host, local_file, opts), opts.quiet, False, None, width)
         return []
 
-    failures = []
+    failures = {}
     state = {"yes_all": opts.yes}
     for host in hosts:
         desc = f"diff {local_file} vs {remote_spec(host, opts)}:{local_file}"
@@ -1268,7 +1305,7 @@ def do_diff(hosts, local_file, opts):
             continue
         rc, output = diff_host(host, local_file, opts)
         if rc >= 2:
-            failures.append(host)
+            failures[host] = None
             warn(f"{host}: {output}")
             if not opts.continue_on_fail:
                 warn("stopping (pass --continue-on-fail/-X to proceed past failures)")
@@ -1384,7 +1421,7 @@ def build_parser():
     inventory_parent.add_argument(
         "--pewrc", metavar="PATH",
         help="Use PATH instead of ~/.pewrc for inventory=/ansible_config=/"
-             "hosts_default=/timestamp_format=/extra_vars= overrides. Same as "
+             "hosts_default=/timestamp_format=/extra_vars=/color= overrides. Same as "
              "$PEW_PEWRC, which this takes precedence over.",
     )
     inventory_parent.add_argument(
@@ -1521,6 +1558,19 @@ def build_parser():
              "full buffered output to print its banner-then-block. If "
              "--log-prefix is also set, PREFIX.hostname is appended to live "
              "as well, so `tail -f` on it works while the host is still running.",
+    )
+    color_mode = run_p.add_mutually_exclusive_group()
+    color_mode.add_argument(
+        "--color", "-C", action="store_true", default=None,
+        help="Color each hostname by its exit status: green for 0, red "
+             "otherwise. Only when stdout is a terminal. Can't combine with "
+             "--follow (output is printed before the exit status is known) "
+             "or --quiet (no hostname to color). Default from ~/.pewrc's "
+             "color=yes; $NO_COLOR turns that default off.",
+    )
+    color_mode.add_argument(
+        "--no-color", dest="color", action="store_false",
+        help="Don't color output, overriding ~/.pewrc's color=",
     )
     run_p.add_argument(
         "command", nargs=argparse.REMAINDER,
@@ -1714,9 +1764,8 @@ def main():
         # given after HOST (`pew shell web1 --root -- sudo -i`). The
         # subcommand is always argv[0], the top-level parser has no options.
         argv = sys.argv[1:]
-        alias = PROG_ALIASES.get(os.path.basename(sys.argv[0]))
-        if alias:
-            argv.insert(0, alias)
+        prog_name = os.path.basename(sys.argv[0])
+        argv[0:0] = PROG_ALIASES.get(prog_name, [])
         if argv:
             argv[0] = expand_subcommand(argv[0], parser.subcommands)
         if argv[:1] and argv[0] in HOST_POSITIONAL:
@@ -1774,6 +1823,9 @@ def main():
                 command = command[1:]
             if not command:
                 die("no command specified")
+            color = determine_color(opts, prog_name in COLOR_ALIASES)
+            opts.color_out = color
+            opts.color_err = color and sys.stderr.isatty()
             failures = do_run(hosts, command, opts)
 
         elif opts.action == "copy":
@@ -1797,7 +1849,11 @@ def main():
             failures = do_diff(hosts, opts.local_file, opts)
 
         if failures:
-            warn(f"{len(failures)}/{len(hosts)} host(s) failed: {', '.join(sorted(failures))}")
+            color = getattr(opts, "color_err", False)
+            listed = ", ".join(
+                paint(h, 1, color) + (f" ({failures[h]})" if failures[h] else "")
+                for h in sorted(failures))
+            warn(f"{len(failures)}/{len(hosts)} host(s) failed: {listed}")
             return 1
         return 0
     except KeyboardInterrupt:
