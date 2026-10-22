@@ -9,7 +9,9 @@ Spiritual successor to the old Perl "mew" tool. Not flag-compatible with it.
 """
 
 import argparse
+import collections
 import concurrent.futures
+import contextlib
 import datetime
 import difflib
 import grp
@@ -24,6 +26,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import unicodedata
 
 PROG = "pew"
 
@@ -32,9 +36,10 @@ PROG = "pew"
 # `pes alpha` is `pew shell alpha`. Keyed on basename(argv[0]).
 PROG_ALIASES = {"pes": ["shell"], "per": ["run"], "pez": ["run", "-P", "-Z"]}
 
-# Aliases that also turn --color on, softly: like ~/.pewrc's color=yes
-# rather than a literal -C, so --follow/--quiet/--no-color still work.
-COLOR_ALIASES = {"pez"}
+# Aliases that also turn on --color/--pretty, softly: like ~/.pewrc's
+# color=yes/pretty=yes rather than a literal flag, so --follow/--quiet/
+# --no-color/--no-pretty still work.
+ALIAS_DEFAULTS = {"pez": {"color", "pretty"}}
 
 # Subcommands whose first positional is HOST unless --hosts/-l is given
 # (`pew run web uptime`). `-` as HOST means ~/.pewrc's hosts_default=.
@@ -45,13 +50,28 @@ HOST_EPILOG = ("HOST is an Ansible host pattern, the same as --hosts. It's "
                "~/.pewrc's hosts_default=.")
 
 
+def out(text=""):
+    """print() for stdout, landing above the --pretty footer if it's up."""
+    if LIVE:
+        LIVE.write(text + "\n", sys.stdout)
+    else:
+        print(text)
+
+
+def err(text):
+    if LIVE:
+        LIVE.write(text + "\n", sys.stderr)
+    else:
+        print(text, file=sys.stderr)
+
+
 def die(msg, code=1):
-    print(f"{PROG}: error: {msg}", file=sys.stderr)
+    err(f"{PROG}: error: {msg}")
     sys.exit(code)
 
 
 def warn(msg):
-    print(f"{PROG}: warning: {msg}", file=sys.stderr)
+    err(f"{PROG}: warning: {msg}")
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +92,7 @@ def paint(text, rc, enabled):
 
 def determine_color(opts, default=False):
     """--color/--no-color > $NO_COLOR > ~/.pewrc [color=] or default (a
-    COLOR_ALIASES name) > off. An explicit --color is rejected with
+    ALIAS_DEFAULTS name) > off. An explicit --color is rejected with
     --follow/--quiet; a default from ~/.pewrc or the alias is just quietly
     dropped there, so it doesn't break every --follow run.
     Either way it then only applies if stdout is actually a terminal."""
@@ -95,6 +115,321 @@ def failure_detail(rc, note):
 
 
 # ---------------------------------------------------------------------------
+# --pretty: a live status footer on stderr while run/copy work, erased when
+# they finish and replaced by one final status line. Everything printed
+# while it's up goes through out()/err(), which put it above the footer.
+# ---------------------------------------------------------------------------
+
+CYAN = "\033[36m"
+DIM = "\033[2m"
+
+# "unicode" sticks to single-column characters so the footer's cursor math
+# holds in any terminal; "emoji" is prettier but double-width, which some
+# terminals/tmux/fonts disagree on.
+PRETTY_STYLES = {
+    "unicode": {"spin": "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", "ok": "✔", "fail": "✘",
+                "wait": "◌", "skip": "⊘", "kill": "■"},
+    "emoji": {"spin": "🕐🕑🕒🕓🕔🕕🕖🕗🕘🕙🕚🕛", "ok": "✅", "fail": "❌",
+              "wait": "⏳", "skip": "🚫", "kill": "🛑"},
+}
+
+LIVE = None
+
+
+def char_width(ch):
+    return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+
+
+def format_elapsed(seconds):
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    return f"{int(seconds // 60)}m{int(seconds % 60):02d}s"
+
+
+class Live:
+    """Per-host state (wait -> run -> ok/fail, or skip; a host still
+    running when the run is interrupted ends up as kill), redrawn ~10x a
+    second below whatever's been printed. The footer is drawn with no
+    trailing newline, so erasing it is: clear this line, then up-and-clear
+    once per extra line."""
+
+    def __init__(self, hosts, style, color, keep_order=False):
+        self.hosts = list(hosts)
+        self.state = dict.fromkeys(self.hosts, "wait")
+        self.started = {}
+        # --sort: finished hosts whose output is still held back behind a
+        # slower host earlier in the order.
+        self.keep_order = keep_order
+        self.printed = set()
+        self.sym = PRETTY_STYLES[style]
+        self.color = color
+        self.lock = threading.RLock()
+        self.drawn = 0
+        self.paused = False
+        self.interrupted = False
+        self.frame = 0
+        self.t0 = time.monotonic()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._tick, daemon=True)
+
+    def __enter__(self):
+        sys.stderr.write("\033[?25l")
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        global LIVE
+        self._stop.set()
+        self._thread.join()
+        with self.lock:
+            LIVE = None
+            if exc_type is KeyboardInterrupt or self.interrupted:
+                head = "interrupted after"
+            elif exc_type is not None:
+                head = "stopped after"
+            else:
+                head = "done in"
+            sys.stderr.write(self._erase() + "\033[?25h"
+                             + self._final_line(head) + "\n")
+            sys.stderr.flush()
+        return False
+
+    def running(self, host):
+        with self.lock:
+            self.state[host] = "run"
+            self.started[host] = time.monotonic()
+
+    def done(self, host, rc):
+        with self.lock:
+            if self.interrupted:
+                self.state[host] = "kill"
+            else:
+                self.state[host] = "ok" if rc == 0 else "fail"
+
+    def released(self, host):
+        with self.lock:
+            self.printed.add(host)
+
+    def skipped(self, host):
+        with self.lock:
+            self.state[host] = "skip"
+
+    def interrupt(self):
+        with self.lock:
+            self.interrupted = True
+
+    def write(self, text, stream):
+        with self.lock:
+            sys.stderr.write(self._erase())
+            sys.stderr.flush()
+            stream.write(text)
+            stream.flush()
+            sys.stderr.write(self._render())
+            sys.stderr.flush()
+
+    @contextlib.contextmanager
+    def pause(self):
+        """Footer off while the confirm prompt waits for an answer."""
+        with self.lock:
+            sys.stderr.write(self._erase() + "\033[?25h")
+            sys.stderr.flush()
+            self.paused = True
+        try:
+            yield
+        finally:
+            with self.lock:
+                self.paused = False
+                sys.stderr.write("\033[?25l" + self._render())
+                sys.stderr.flush()
+
+    def _tick(self):
+        while not self._stop.wait(0.1):
+            with self.lock:
+                if self.paused:
+                    continue
+                self.frame += 1
+                sys.stderr.write(self._erase() + self._render())
+                sys.stderr.flush()
+
+    def _erase(self):
+        if not self.drawn:
+            return ""
+        seq = "\r\033[2K" + "\033[1A\033[2K" * (self.drawn - 1)
+        self.drawn = 0
+        return seq
+
+    def _render(self):
+        if self.paused:
+            return ""
+        try:
+            cols, rows = os.get_terminal_size(sys.stderr.fileno())
+        except OSError:
+            cols = rows = 0
+        cols, rows = cols or 80, rows or 24  # a pty that never got a size
+        # At most half the screen, so results stay visible above it.
+        lines = self._lines(max(cols - 1, 20), max(rows // 2, 4))
+        self.drawn = len(lines)
+        return "\n".join(lines)
+
+    def _paint(self, color, text):
+        return f"{color}{text}{RESET}" if self.color and color else text
+
+    def _fit(self, segments, width):
+        """Join (text, color) segments, cut off at width display columns."""
+        parts, used = [], 0
+        for text, color in segments:
+            piece = ""
+            for ch in text:
+                w = char_width(ch)
+                if used + w > width:
+                    break
+                piece += ch
+                used += w
+            if piece:
+                parts.append(self._paint(color, piece))
+            if len(piece) < len(text):
+                break
+        return "".join(parts)
+
+    def _lines(self, width, max_lines):
+        sym, now = self.sym, time.monotonic()
+        spin = sym["spin"][self.frame % len(sym["spin"])]
+        running = [h for h in self.hosts if self.state[h] == "run"]
+        waiting = [h for h in self.hosts if self.state[h] == "wait"]
+        counts = collections.Counter(self.state.values())
+
+        lines = [self._fit([("─" * 60, DIM)], width)]
+        room = max_lines - 1 - (1 if waiting else 0) - 1
+        shown = running if len(running) <= room else running[:max(room - 1, 0)]
+        hw = label_width(shown)
+        for h in shown:
+            lines.append(self._fit([(f"{spin} ", CYAN), (f"{h:<{hw}}  ", None),
+                                    (format_elapsed(now - self.started[h]), DIM)], width))
+        if len(shown) < len(running):
+            lines.append(self._fit([(f"{spin} +{len(running) - len(shown)} more running", CYAN)], width))
+        if waiting:
+            lines.append(self._fit([(f"{sym['wait']} waiting: ", DIM),
+                                    (self._name_list(waiting, width - 12), None)], width))
+
+        segs = [(f"{sym['ok']} {counts['ok']} ok", GREEN), ("  ", None),
+                (f"{sym['fail']} {counts['fail']} failed", RED if counts["fail"] else None)]
+        held = sum(1 for h in self.hosts
+                   if self.state[h] in ("ok", "fail") and h not in self.printed)
+        if self.keep_order and held:
+            segs += [("  ", None), (f"({held} held)", DIM)]
+        if counts["skip"]:
+            segs += [("  ", None), (f"{sym['skip']} {counts['skip']} skipped", DIM)]
+        segs += [("  ", None), (f"{spin} {len(running)} running", CYAN),
+                 ("  ", None), (f"{sym['wait']} {len(waiting)} waiting", DIM),
+                 ("  ", None), (format_elapsed(now - self.t0), DIM)]
+        lines.append(self._fit(segs, width))
+        return lines
+
+    @staticmethod
+    def _name_list(names, width):
+        """As many names as fit in width columns, then (+N) for the rest."""
+        shown = []
+        for i, name in enumerate(names):
+            rest = len(names) - i - 1
+            candidate = ", ".join(shown + [name]) + (f" (+{rest})" if rest else "")
+            if shown and len(candidate) > width:
+                break
+            shown.append(name)
+        rest = len(names) - len(shown)
+        return ", ".join(shown) + (f" (+{rest})" if rest else "")
+
+    def _final_line(self, head):
+        sym = self.sym
+        counts = collections.Counter(self.state.values())
+        killed = counts["kill"] + counts["run"]
+        parts = [self._paint(GREEN, f"{sym['ok']} {counts['ok']} ok"),
+                 self._paint(RED if counts["fail"] else None,
+                             f"{sym['fail']} {counts['fail']} failed")]
+        if counts["skip"]:
+            parts.append(f"{sym['skip']} {counts['skip']} skipped")
+        if killed:
+            parts.append(self._paint(RED, f"{sym['kill']} {killed} killed"))
+        if counts["wait"]:
+            parts.append(f"{sym['wait']} {counts['wait']} not run")
+        elapsed = format_elapsed(time.monotonic() - self.t0)
+        return f"{PROG}: {head} {elapsed}: " + "  ".join(parts)
+
+
+def determine_pretty(opts, default=False):
+    """--pretty/--no-pretty > ~/.pewrc [pretty=] or default (an
+    ALIAS_DEFAULTS name) > off. Then only if stderr, where the footer
+    goes, is a terminal, and never for --dry-run, which has nothing to
+    watch."""
+    if opts.pretty is None:
+        wanted = default or load_pewrc().get("pretty", "").lower() in TRUTHY
+    else:
+        wanted = opts.pretty
+    return wanted and not opts.dry_run and sys.stderr.isatty()
+
+
+def start_live(hosts, opts):
+    """A Live for this run, honoring ~/.pewrc's pretty_style= and
+    --no-color/$NO_COLOR for the footer's own colors."""
+    style = load_pewrc().get("pretty_style", "unicode")
+    if style not in PRETTY_STYLES:
+        warn(f"unknown pretty_style={style!r} in {PEWRC_PATH}, using unicode")
+        style = "unicode"
+    color = getattr(opts, "color", None) is not False and "NO_COLOR" not in os.environ
+    # Only parallel runs can finish out of order; serial --sort is just
+    # the launch order.
+    return Live(hosts, style, color, keep_order=opts.sort and opts.parallel)
+
+
+def track(host, fn, *args):
+    """fn(host, *args), reported to the --pretty footer as running, then
+    done with fn's rc (the first element of what it returns)."""
+    if LIVE:
+        LIVE.running(host)
+    result = fn(host, *args)
+    if LIVE:
+        LIVE.done(host, result[0])
+    return result
+
+
+def skip_host(host):
+    out(f"*** {host}: SKIPPED ***")
+    if LIVE:
+        LIVE.skipped(host)
+
+
+def paused():
+    return LIVE.pause() if LIVE else contextlib.nullcontext()
+
+
+def results(future_to_host, hosts, opts):
+    """(host, result) for each finished future: as each completes, or
+    with --sort in host order, each one as soon as it and every host
+    before it are done (so one slow host holds back the rest)."""
+    if not opts.sort:
+        for fut in concurrent.futures.as_completed(future_to_host):
+            yield future_to_host[fut], fut.result()
+        return
+    by_host = {h: fut for fut, h in future_to_host.items()}
+    for h in hosts:
+        yield h, by_host[h].result()
+        if LIVE:
+            LIVE.released(h)
+
+
+@contextlib.contextmanager
+def cancel_on_interrupt(ex):
+    """On Ctrl-C, drop the executor's queued hosts instead of letting
+    `with ThreadPoolExecutor` wait for every one of them to run."""
+    try:
+        yield
+    except KeyboardInterrupt:
+        if LIVE:
+            LIVE.interrupt()
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Verbose/debug logging. Plain module globals (set once in main()) rather
 # than threading opts through every function, matching the original mew's
 # own $DEBUG global.
@@ -106,29 +441,29 @@ DEBUG = False
 
 def info(msg):
     if VERBOSE or DEBUG:
-        print(f"{PROG}: {msg}", file=sys.stderr)
+        err(f"{PROG}: {msg}")
 
 
 def debug(msg):
     if DEBUG:
-        print(f"{PROG}: debug: {msg}", file=sys.stderr)
+        err(f"{PROG}: debug: {msg}")
 
 
 def debug_cmd(cmd):
     if DEBUG:
-        print(f"{PROG}: debug: + {shlex.join(cmd)}", file=sys.stderr)
+        err(f"{PROG}: debug: + {shlex.join(cmd)}")
 
 
 def debug_json(label, data):
     if DEBUG:
-        print(f"{PROG}: debug: {label}:", file=sys.stderr)
-        print(json.dumps(data, indent=2, sort_keys=True), file=sys.stderr)
+        err(f"{PROG}: debug: {label}:")
+        err(json.dumps(data, indent=2, sort_keys=True))
 
 
 def debug_block(label, text):
     if DEBUG and text and text.strip():
-        print(f"{PROG}: debug: {label}:", file=sys.stderr)
-        print(text.rstrip(), file=sys.stderr)
+        err(f"{PROG}: debug: {label}:")
+        err(text.rstrip())
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +551,25 @@ def apply_ansible_config():
     os.environ["ANSIBLE_CONFIG"] = config_path
 
 
+def natural_key(name):
+    """node2 before node10: digit runs compare as numbers. re.split with a
+    capture group alternates text, digits, text..., so tuples always line
+    up str-with-str and int-with-int."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+
+
+def determine_sort(opts):
+    """--sort/--no-sort > ~/.pewrc [sort=] > off. Sorting results can't
+    mean anything for --parallel --follow's interleaved live lines, so an
+    explicit --sort there is an error and ~/.pewrc's sort=yes still sorts
+    the launch order but nothing more."""
+    if opts.sort and getattr(opts, "parallel", False) and getattr(opts, "follow", False):
+        die("--sort/-r can't be combined with --parallel --follow")
+    if opts.sort is None:
+        return load_pewrc().get("sort", "").lower() in TRUTHY
+    return opts.sort
+
+
 def resolve_hosts(pattern, inventory=None, sort=False, allow_empty=False):
     inventory = determine_inventory(inventory)
     info(f"resolving hosts for pattern {pattern!r}"
@@ -241,7 +595,7 @@ def resolve_hosts(pattern, inventory=None, sort=False, allow_empty=False):
         if allow_empty:
             return []
         die(no_match_message(pattern, inventory))
-    hosts = sorted(hosts) if sort else hosts
+    hosts = sorted(hosts, key=natural_key) if sort else hosts
     info(f"resolved {len(hosts)} host(s)")
     debug(f"host list: {', '.join(hosts)}")
     return hosts
@@ -676,26 +1030,27 @@ def confirm(host, description, state, width=0):
     """Returns True if the action should run on this host."""
     if state["yes_all"]:
         return True
-    while True:
-        try:
-            ans = input(f"{host:<{width}}: {description} [Y/n/a/q/?] ").strip().lower()
-        except EOFError:
-            ans = "q"
-        ans = CONFIRM_SYNONYMS.get(ans)
-        if ans == "y":
-            return True
-        if ans == "n":
-            return False
-        if ans == "q":
-            print(f"{PROG}: quit on demand")
-            sys.exit(1)
-        if ans == "a":
-            state["yes_all"] = True
-            return True
-        if ans == "?":
-            print(CONFIRM_HELP)
-            continue
-        print("Don't understand that. Use '?' for help.")
+    with paused():
+        while True:
+            try:
+                ans = input(f"{host:<{width}}: {description} [Y/n/a/q/?] ").strip().lower()
+            except EOFError:
+                ans = "q"
+            ans = CONFIRM_SYNONYMS.get(ans)
+            if ans == "y":
+                return True
+            if ans == "n":
+                return False
+            if ans == "q":
+                print(f"{PROG}: quit on demand")
+                sys.exit(1)
+            if ans == "a":
+                state["yes_all"] = True
+                return True
+            if ans == "?":
+                print(CONFIRM_HELP)
+                continue
+            print("Don't understand that. Use '?' for help.")
 
 
 # ---------------------------------------------------------------------------
@@ -929,7 +1284,7 @@ def timestamp_prefix(opts):
 
 def emit_line(host, line, quiet, width, opts=None):
     ts = timestamp_prefix(opts)
-    print(f"{ts}{line}" if quiet else f"{ts}{host:<{width}}: {line}")
+    out(f"{ts}{line}" if quiet else f"{ts}{host:<{width}}: {line}")
 
 
 def open_log(log_prefix, host):
@@ -945,7 +1300,7 @@ def do_run_follow_serial(hosts, args, opts, width):
     for host in hosts:
         desc = run_cmdline(host, args, opts)
         if not confirm(host, desc, state, width):
-            print(f"*** {host}: SKIPPED ***")
+            skip_host(host)
             continue
         log_f = open_log(opts.log_prefix, host)
 
@@ -954,7 +1309,7 @@ def do_run_follow_serial(hosts, args, opts, width):
             if log_f:
                 log_f.write(line + "\n")
 
-        rc, note = run_host_streaming(host, args, opts, on_line)
+        rc, note = track(host, run_host_streaming, args, opts, on_line)
         if log_f:
             log_f.close()
         if rc != 0:
@@ -973,13 +1328,14 @@ def do_run_follow_parallel(hosts, args, opts, width):
     def worker(host):
         def on_line(line):
             q.put((host, line))
-        rc, note = run_host_streaming(host, args, opts, on_line)
+        rc, note = track(host, run_host_streaming, args, opts, on_line)
         q.put((host, DONE))
         return rc, note
 
     failures = {}
     max_workers = opts.jobs if opts.jobs else len(hosts)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+    with (concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex,
+          cancel_on_interrupt(ex)):
         future_to_host = {ex.submit(worker, h): h for h in hosts}
         remaining = len(hosts)
         while remaining > 0:
@@ -1016,21 +1372,21 @@ def emit(host, output, quiet, multiline, log_prefix, width=0, opts=None, rc=None
 
     if quiet:
         for line in output.splitlines():
-            print(f"{ts}{line}")
+            out(f"{ts}{line}")
         return
 
     if multiline:
-        print(f"{ts}### {paint(host.upper(), rc, color)} ###")
+        out(f"{ts}### {paint(host.upper(), rc, color)} ###")
         for line in output.splitlines():
-            print(f"{ts}{line}")
+            out(f"{ts}{line}")
         return
 
     prefix = paint(host, rc, color) + " " * (width - len(host)) + ": "
     lines = output.splitlines()
     if not lines:
-        print(f"{ts}{prefix}")
+        out(f"{ts}{prefix}")
     for line in lines:
-        print(f"{ts}{prefix}{line}")
+        out(f"{ts}{prefix}{line}")
 
 
 def run_cmdline(host, args, opts):
@@ -1054,13 +1410,12 @@ def do_run(hosts, args, opts):
 
     if opts.parallel:
         max_workers = opts.jobs if opts.jobs else len(hosts)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        with (concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex,
+              cancel_on_interrupt(ex)):
             future_to_host = {
-                ex.submit(run_host, h, args, opts): h for h in hosts
+                ex.submit(track, h, run_host, args, opts): h for h in hosts
             }
-            for fut in concurrent.futures.as_completed(future_to_host):
-                host = future_to_host[fut]
-                rc, output, note = fut.result()
+            for host, (rc, output, note) in results(future_to_host, hosts, opts):
                 emit(host, output, opts.quiet, opts.multiline, opts.log_prefix, width, opts, rc)
                 if rc != 0:
                     failures[host] = failure_detail(rc, note)
@@ -1070,9 +1425,9 @@ def do_run(hosts, args, opts):
     for host in hosts:
         desc = run_cmdline(host, args, opts)
         if not confirm(host, desc, state, width):
-            print(f"*** {host}: SKIPPED ***")
+            skip_host(host)
             continue
-        rc, output, note = run_host(host, args, opts)
+        rc, output, note = track(host, run_host, args, opts)
         emit(host, output, opts.quiet, opts.multiline, opts.log_prefix, width, opts, rc)
         if rc != 0:
             failures[host] = failure_detail(rc, note)
@@ -1216,13 +1571,12 @@ def do_copy(hosts, targets, opts):
 
     if opts.parallel:
         max_workers = opts.jobs if opts.jobs else len(hosts)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        with (concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex,
+              cancel_on_interrupt(ex)):
             future_to_host = {
-                ex.submit(copy_host, h, targets, opts): h for h in hosts
+                ex.submit(track, h, copy_host, targets, opts): h for h in hosts
             }
-            for fut in concurrent.futures.as_completed(future_to_host):
-                host = future_to_host[fut]
-                rc, result = fut.result()
+            for host, (rc, result) in results(future_to_host, hosts, opts):
                 if rc != 0:
                     failures[host] = None
                     warn(f"{host}: rsync failed: {result}")
@@ -1234,9 +1588,9 @@ def do_copy(hosts, targets, opts):
     for host in hosts:
         desc = f"rsync {copy_description(host, targets, opts)}"
         if not confirm(host, desc, state, width):
-            print(f"*** {host}: SKIPPED ***")
+            skip_host(host)
             continue
-        rc, result = copy_host(host, targets, opts)
+        rc, result = track(host, copy_host, targets, opts)
         if rc != 0:
             failures[host] = None
             warn(f"{host}: rsync failed: {result}")
@@ -1301,7 +1655,7 @@ def do_diff(hosts, local_file, opts):
     for host in hosts:
         desc = f"diff {local_file} vs {remote_spec(host, opts)}:{local_file}"
         if not confirm(host, desc, state, width):
-            print(f"*** {host}: SKIPPED ***")
+            skip_host(host)
             continue
         rc, output = diff_host(host, local_file, opts)
         if rc >= 2:
@@ -1421,7 +1775,9 @@ def build_parser():
     inventory_parent.add_argument(
         "--pewrc", metavar="PATH",
         help="Use PATH instead of ~/.pewrc for inventory=/ansible_config=/"
-             "hosts_default=/timestamp_format=/extra_vars=/color= overrides. Same as "
+             "hosts_default=/timestamp_format=/extra_vars=/color=/pretty=/sort= "
+             "overrides. "
+             "Same as "
              "$PEW_PEWRC, which this takes precedence over.",
     )
     inventory_parent.add_argument(
@@ -1448,8 +1804,18 @@ def build_parser():
              "fact-gathering. Appended after ~/.pewrc's extra_vars=, so "
              "these win.",
     )
-    filter_parent.add_argument(
-        "--sort", "-r", action="store_true", help="Sort hosts before processing",
+    sort_mode = filter_parent.add_mutually_exclusive_group()
+    sort_mode.add_argument(
+        "--sort", "-r", action="store_true", default=None,
+        help="Process hosts in natural hostname order (node2 before "
+             "node10), and with --parallel print results in that order "
+             "too: each host's as soon as it and every host before it "
+             "have finished. Can't combine with --parallel --follow. "
+             "Default from ~/.pewrc's sort=yes.",
+    )
+    sort_mode.add_argument(
+        "--no-sort", dest="sort", action="store_false",
+        help="Don't sort, overriding ~/.pewrc's sort=",
     )
     filter_parent.add_argument(
         "--where", action="append", type=parse_where, metavar="KEY<op>VALUE",
@@ -1494,6 +1860,20 @@ def build_parser():
     )
 
     exec_parent = argparse.ArgumentParser(add_help=False, parents=[host_parent])
+    pretty_mode = exec_parent.add_mutually_exclusive_group()
+    pretty_mode.add_argument(
+        "--pretty", action="store_true", default=None,
+        help="While running, show a live status footer of which hosts are "
+             "waiting, running (with elapsed time) and done; it's erased "
+             "at the end, leaving just the results and one final status "
+             "line. Only when stderr is a terminal. Implies --color where "
+             "that applies. Default from ~/.pewrc's pretty=yes; "
+             "pretty_style=emoji there for emoji instead of plain symbols.",
+    )
+    pretty_mode.add_argument(
+        "--no-pretty", dest="pretty", action="store_false",
+        help="No live status footer, overriding ~/.pewrc's pretty=",
+    )
     exec_parent.add_argument(
         "--parallel", "-P", action="store_true",
         help="Run across all matched hosts concurrently (implies --yes)",
@@ -1756,7 +2136,8 @@ def expand_subcommand(word, names):
 
 
 def main():
-    global VERBOSE, DEBUG, PEWRC_PATH
+    global VERBOSE, DEBUG, PEWRC_PATH, LIVE
+    live = None
     try:
         parser = build_parser()
         # shell's command is split off at the first -- before argparse sees
@@ -1802,6 +2183,7 @@ def main():
 
         opts.hosts = determine_hosts(opts.hosts)
 
+        opts.sort = determine_sort(opts)
         hosts = resolve_hosts(opts.hosts, opts.inventory, opts.sort)
         if opts.where:
             hosts = filter_by_where(hosts, opts.where, opts)
@@ -1817,46 +2199,59 @@ def main():
 
         opts.connections = resolve_connections(hosts, opts)
 
-        if opts.action == "run":
-            command = opts.command
-            if command and command[0] == "--":
-                command = command[1:]
-            if not command:
-                die("no command specified")
-            color = determine_color(opts, prog_name in COLOR_ALIASES)
-            opts.color_out = color
-            opts.color_err = color and sys.stderr.isatty()
-            failures = do_run(hosts, command, opts)
+        alias_defaults = ALIAS_DEFAULTS.get(prog_name, set())
+        pretty = (opts.action in ("run", "copy")
+                  and determine_pretty(opts, "pretty" in alias_defaults))
 
-        elif opts.action == "copy":
-            if opts.same:
-                if not opts.paths:
-                    die("--same needs at least one source file")
-                local_files, remote_path = opts.paths, None
-                for f in local_files:
-                    if not os.path.isabs(f):
-                        die(f"--same requires absolute paths: {f}")
-            else:
-                if len(opts.paths) < 2:
-                    die("copy needs at least one local file and a remote destination "
-                        "path (SOURCE... DEST) — or pass --same to push each file to "
-                        "its identical path on the remote host")
-                local_files, remote_path = opts.paths[:-1], opts.paths[-1]
-            targets = build_copy_targets(local_files, remote_path, opts.same)
-            failures = do_copy(hosts, targets, opts)
+        # The --pretty footer (if any) closes on the way out of here: after
+        # the failure summary, and on Ctrl-C/die() too, always ending with
+        # its final status line.
+        with contextlib.ExitStack() as stack:
+            if opts.action == "run":
+                command = opts.command
+                if command and command[0] == "--":
+                    command = command[1:]
+                if not command:
+                    die("no command specified")
+                color = determine_color(opts, "color" in alias_defaults or pretty)
+                opts.color_out = color
+                opts.color_err = color and sys.stderr.isatty()
+                if pretty:
+                    live = LIVE = stack.enter_context(start_live(hosts, opts))
+                failures = do_run(hosts, command, opts)
 
-        elif opts.action == "diff":
-            failures = do_diff(hosts, opts.local_file, opts)
+            elif opts.action == "copy":
+                if opts.same:
+                    if not opts.paths:
+                        die("--same needs at least one source file")
+                    local_files, remote_path = opts.paths, None
+                    for f in local_files:
+                        if not os.path.isabs(f):
+                            die(f"--same requires absolute paths: {f}")
+                else:
+                    if len(opts.paths) < 2:
+                        die("copy needs at least one local file and a remote destination "
+                            "path (SOURCE... DEST) — or pass --same to push each file to "
+                            "its identical path on the remote host")
+                    local_files, remote_path = opts.paths[:-1], opts.paths[-1]
+                targets = build_copy_targets(local_files, remote_path, opts.same)
+                if pretty:
+                    live = LIVE = stack.enter_context(start_live(hosts, opts))
+                failures = do_copy(hosts, targets, opts)
 
-        if failures:
-            color = getattr(opts, "color_err", False)
-            listed = ", ".join(
-                paint(h, 1, color) + (f" ({failures[h]})" if failures[h] else "")
-                for h in sorted(failures))
-            warn(f"{len(failures)}/{len(hosts)} host(s) failed: {listed}")
-            return 1
-        return 0
+            elif opts.action == "diff":
+                failures = do_diff(hosts, opts.local_file, opts)
+
+            if failures:
+                color = getattr(opts, "color_err", False)
+                listed = ", ".join(
+                    paint(h, 1, color) + (f" ({failures[h]})" if failures[h] else "")
+                    for h in sorted(failures, key=natural_key))
+                warn(f"{len(failures)}/{len(hosts)} host(s) failed: {listed}")
+                return 1
+            return 0
     except KeyboardInterrupt:
-        print()
+        if live is None:  # the footer's final line already ended the ^C line
+            print()
         return 130
 

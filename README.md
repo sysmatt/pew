@@ -59,7 +59,8 @@ sudo pipx install --global .
 ```
 
 pipx also installs three shortcuts, `pes` (= `pew shell`), `per`
-(= `pew run`) and `pez` (= `pew run -P -Z`, plus color) — see
+(= `pew run`) and `pez` (= `pew run -P -Z`, plus color and the live
+status footer) — see
 [Shortcuts](#shortcuts-pes-per-and-pez). With the symlink install, add
 them yourself:
 
@@ -183,7 +184,8 @@ to remember `--inventory` on every invocation.
 Pass `--pewrc PATH` (or set `$PEW_PEWRC`; `--pewrc` wins if both are
 set) to use a different rc file entirely — it replaces `~/.pewrc` for
 every setting on this page (`inventory=`, `ansible_config=`,
-`hosts_default=`, `timestamp_format=`, `extra_vars=`, `color=`). Useful for per-project config,
+`hosts_default=`, `timestamp_format=`, `extra_vars=`, `color=`, `pretty=`,
+`pretty_style=`, `sort=`). Useful for per-project config,
 or for testing.
 
 ### What about the rest of `ansible.cfg`?
@@ -423,20 +425,22 @@ full names in scripts**; prefixes are for typing.
 
 Run under the name `pes`, pew acts as `pew shell`; under `per`, as
 `pew run`. Under `pez` it acts as `pew run --parallel --yes` with
-[`--color`](#--color--hostname-colored-by-exit-status) turned on.
+[`--color`](#--color--hostname-colored-by-exit-status) and
+[`--pretty`](#--pretty--live-status-while-it-runs) turned on.
 Everything after is passed through unchanged:
 
 ```sh
 pes alpha                            # pew shell alpha
 pes alpha --root -- htop             # pew shell alpha --root -- htop
 per web uptime                       # pew run web uptime
-pez web uptime                       # pew run -P -Z -C web uptime
+pez web uptime                       # pew run -P -Z -C --pretty web uptime
 ```
 
-`pez` turns color on the same soft way `color=yes` in `~/.pewrc` does,
-not as a literal `-C`. So `pez web -f ...` and `pez web -q ...` still
-work (just without color), `--no-color` and `$NO_COLOR` turn it off,
-and piped output stays plain.
+`pez` turns color and the footer on the same soft way `color=yes` and
+`pretty=yes` in `~/.pewrc` do, not as literal flags. So `pez web -f ...`
+and `pez web -q ...` still work (just without hostname color),
+`--no-color`, `--no-pretty` and `$NO_COLOR` turn them off, and piped
+output stays plain.
 
 It's keyed on the name pew was invoked as, so it works the same for the
 pipx entry points and for a symlink to `./pew` (see **Install**).
@@ -581,6 +585,34 @@ ask "run on this host?" one at a time when they're all launched at
 once) — by default, output is buffered per host and printed as each one
 finishes, so lines from different hosts never get interleaved mid-line.
 
+#### `--sort` — hostname order
+
+`--sort`/`-r` processes hosts in natural hostname order, where digit
+runs compare as numbers, so `node2` comes before `node10`. A serial run
+then prints its results in that order too.
+
+With `--parallel`, hosts also launch in that order, and results print
+in it. Each host's output appears as soon as it and every host before
+it have finished, not only once the whole run is done. So one slow host
+holds back the hosts after it, and they all print when it finishes.
+With [`--pretty`](#--pretty--live-status-while-it-runs) the footer's
+counts line shows how many finished hosts are waiting their turn, as
+`(3 held)`.
+
+```sh
+pew run --hosts webservers --parallel --sort -- uptime
+```
+
+`--parallel --follow` streams interleaved live lines, which can't be
+sorted, so an explicit `--sort` there is an error. Serial `--follow
+--sort` is fine.
+
+Put `sort=yes` in `~/.pewrc` to sort by default, and `--no-sort` turns
+it off for one run. That default also applies to `list`, `diff`, and
+the like. On `--parallel --follow` it just sorts the launch order and
+doesn't error. `pez` doesn't turn on sorting, since it's built for speed
+and quick feedback. Use `pez -r ...` when you want sorted output.
+
 #### `--follow` — stream output live instead of waiting
 
 ```sh
@@ -683,6 +715,51 @@ explicit `--color` still wins over `$NO_COLOR`. The `~/.pewrc` default
 quietly does nothing on `--follow`/`--quiet` runs, so those keep working
 with no color.
 
+#### `--pretty` — live status while it runs
+
+`--pretty` keeps a status footer at the bottom of the terminal while
+hosts run. It shows each running host with its elapsed time, the hosts
+still waiting (on a `--jobs` slot, or their turn in a serial run), and
+running counts. Results print above it as each host finishes:
+
+```
+alpha.example.com  :  14:02:11 up 41 days, load average: 0.12
+─────────────────────────────────────────────
+⠹ bravo.example.com    4.2s
+⠹ charlie.example.com  1.1s
+◌ waiting: delta.example.com, echo.example.com (+12)
+✔ 1 ok  ✘ 0 failed  ⠹ 2 running  ◌ 14 waiting  6.3s
+```
+
+When the run ends the footer is erased, leaving just the results, the
+usual failure summary and one final status line:
+
+```
+pew: warning: 1/17 host(s) failed: bravo.example.com (255)
+pew: done in 12.4s: ✔ 16 ok  ✘ 1 failed
+```
+
+Ctrl-C also erases the footer. Queued hosts are cancelled instead of
+being started, and the final line reports where the run got to:
+`pew: interrupted after 3.1s: ✔ 4 ok  ✘ 0 failed  ■ 2 killed  ◌ 11 not run`.
+
+It works with serial and `--parallel` runs, with `--follow` (streamed
+lines print above the footer) and with `pew copy`. In serial mode the
+footer steps aside while the confirm prompt waits for an answer.
+`--pretty` implies `--color` wherever color applies.
+
+The footer is drawn on stderr and only when stderr is a terminal. So
+`pew run ... --pretty > results.txt` shows progress on screen while
+the file gets only results, and piped runs never see escape codes.
+`--dry-run` doesn't draw it.
+
+Put `pretty=yes` in `~/.pewrc` to have it on by default, and
+`--no-pretty` turns it off for one run. The footer uses single-width
+symbols that line up in any terminal. For emoji instead
+(🕐 ✅ ❌ ⏳), set `pretty_style=emoji`. Most terminals draw emoji two
+columns wide, and a few don't agree on that, which can garble the
+footer.
+
 ### `pew copy` — push file(s) to each host
 
 ```sh
@@ -744,6 +821,9 @@ pew copy --hosts webservers --verbose app.conf /etc/app/app.conf
 host's output (the real `rsync` output if `--verbose`/`--debug` was
 used, otherwise the fallback confirmation line) is also appended to
 `PREFIX.hostname`.
+
+[`--pretty`](#--pretty--live-status-while-it-runs) works here too,
+showing each host's rsync as running, waiting or done.
 
 #### `--same` — push to the identical remote path
 
