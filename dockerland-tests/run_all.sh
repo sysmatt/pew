@@ -36,6 +36,7 @@ SCRIPTS=(
     18_run_color.sh
     19_pretty.sh
     20_sort.sh
+    21_controller_side_facts.sh
 )
 $SKIP_STRESS || SCRIPTS+=(stress_10.sh)
 

@@ -905,6 +905,32 @@ def gather_inventory_vars(hosts, opts):
     return {h: all_hostvars[h] for h in hosts if h in all_hostvars}
 
 
+# Connection plugins that run ordinary modules like setup on the
+# controller rather than on the target (network_cli/httpapi/netconf only
+# route their own network modules to the device). Gathered "facts" for
+# such a host describe the machine pew is running on, so they're never
+# gathered: --where judges those hosts on inventory vars alone. Container/
+# VM/Windows plugins (docker, incus, winrm, ...) run setup inside the
+# target and are gathered as usual.
+CONTROLLER_SIDE_CONNECTIONS = {"local", "network_cli", "httpapi", "netconf"}
+
+
+def controller_side_hosts(hosts, inv_vars):
+    """{host: connection} for hosts whose inventory ansible_connection is
+    one of CONTROLLER_SIDE_CONNECTIONS, matched on its last dotted part
+    (ansible.netcommon.network_cli). A templated value can't be judged
+    unrendered, so it's gathered as usual."""
+    skipped = {}
+    for host in hosts:
+        conn = inv_vars.get(host, {}).get("ansible_connection")
+        if not isinstance(conn, str) or "{{" in conn:
+            continue
+        name = conn.rsplit(".", 1)[-1]
+        if name in CONTROLLER_SIDE_CONNECTIONS:
+            skipped[host] = name
+    return skipped
+
+
 def filter_by_where(hosts, wheres, opts):
     if not wheres:
         return hosts
@@ -913,7 +939,13 @@ def filter_by_where(hosts, wheres, opts):
     top_level_keys = {segs[0] for segs, _, _ in parsed if segs}
 
     inv_vars = gather_inventory_vars(hosts, opts)
-    facts = gather_facts(hosts, top_level_keys, opts)
+    skipped = controller_side_hosts(hosts, inv_vars)
+    if skipped:
+        info(f"{len(skipped)} host(s) use a controller-side connection "
+             f"({', '.join(sorted(set(skipped.values())))}): judged on "
+             f"inventory vars only: {', '.join(sorted(skipped, key=natural_key))}")
+    gatherable = [h for h in hosts if h not in skipped]
+    facts = gather_facts(gatherable, top_level_keys, opts) if gatherable else {}
 
     matched, unreachable = [], []
     for host in hosts:
@@ -922,7 +954,7 @@ def filter_by_where(hosts, wheres, opts):
         merged = {**inv_vars.get(host, {}), **facts.get(host, {})}
         if all(where_matches(merged, segs, op, v) for segs, op, v in parsed):
             matched.append(host)
-        elif host not in facts:
+        elif host not in facts and host not in skipped:
             # No fact data at all for this host, and it didn't match on
             # inventory vars alone — genuinely unknown, not just a
             # confident non-match, so treat it as unreachable.
@@ -954,9 +986,11 @@ def row_matches(path, value, match_any, match_keys, match_values):
 
 def do_facts(hosts, opts):
     inv_vars = gather_inventory_vars(hosts, opts)
-    facts = gather_facts(hosts, None, opts)
+    skipped = controller_side_hosts(hosts, inv_vars)
+    gatherable = [h for h in hosts if h not in skipped]
+    facts = gather_facts(gatherable, None, opts) if gatherable else {}
 
-    unreachable = [h for h in hosts if h not in facts]
+    unreachable = [h for h in gatherable if h not in facts]
     if unreachable:
         hint = "" if DEBUG else " (rerun with --debug to see ansible's output)"
         warn(f"could not gather facts from {len(unreachable)} host(s): "
@@ -975,6 +1009,12 @@ def do_facts(hosts, opts):
         for label, data, other_label in (
             ("facts", host_facts, "variable"), ("vars", host_vars, "fact"),
         ):
+            if label == "facts" and host in skipped:
+                print(f"  {label}:")
+                print(f"    (not gathered: {skipped[host]} runs modules on the "
+                      f"controller, so its facts would describe this machine, "
+                      f"not {host})")
+                continue
             rows = list(flatten(data))
             shown = [
                 (p, v) for p, v in rows

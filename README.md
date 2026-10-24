@@ -377,6 +377,23 @@ your `--where` clauses are fully satisfied by inventory data, an
 unreachable host still matches normally, since no connection was ever
 needed to answer that particular question.
 
+**Controller-side connections.** Some hosts have an `ansible_connection`
+that runs ordinary modules like `setup` on the controller rather than
+on the target: `local`, `network_cli`, `httpapi` and `netconf`
+(including the prefixed spellings, such as
+`ansible.netcommon.network_cli`). Network gear like a MikroTik on
+`network_cli` is the usual case. If pew gathered facts for those hosts,
+the facts would describe the machine you're running pew on, so a router
+would "match" `ansible_distribution=Ubuntu`. Instead, pew never gathers
+facts for them. `--where` judges them on inventory variables alone, so
+`--where 'ansible_network_os~=routeros'` still finds them, and they
+don't count as unreachable. `-v` lists which hosts this applied to.
+`pew facts` shows a note in place of their facts, followed by their
+inventory variables. Container, VM and Windows connections (`docker`,
+`incus`, `winrm`, …) run `setup` inside the target, so their facts are
+gathered as usual. `pew run`/`shell` aren't affected: they always use
+plain ssh, which works fine for running RouterOS commands.
+
 ## Verbose and debug output
 
 Available on all six subcommands, both writing to stderr so they
