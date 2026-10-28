@@ -22,8 +22,10 @@ import os
 import pwd
 import queue
 import re
+import select
 import selectors
 import shlex
+import signal
 import socket
 import stat
 import struct
@@ -1840,23 +1842,337 @@ def resolve_shell_host(pattern, opts):
     return hosts[0]
 
 
+SHELL_SPINNER_DELAY = 0.25   # a check done by then shows nothing at all
+SHELL_CONNECT_TIMEOUT = 2.0  # per attempt: long enough for a slow link
+SHELL_BANNER_TIMEOUT = 1.0
+SHELL_RETRY_EVERY = 1.0
+SHELL_FAST_FAIL = 10.0       # an ssh exiting 255 sooner never had a session
+SHELL_FAST_FAIL_LIMIT = 3
+SHELL_PROXY_RETRY_DELAY = 2.0
+SHELL_BACKOFF_MAX = 60.0     # --persist: longest wait after quick failures
+SHELL_KEEPALIVE = ["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"]
+FALSY = {"0", "no", "false", "off"}
+
+
+def parse_jump(spec):
+    """ssh -G args for the first hop of a ProxyJump value: [user@]host[:port]
+    or ssh://[user@]host[:port], an IPv6 address in brackets."""
+    first = spec.split(",")[0].strip()
+    if first.startswith("ssh://"):
+        first = first[len("ssh://"):]
+    user, _, hostport = first.rpartition("@")
+    m = re.fullmatch(r"\[([^\]]+)\](?::(\d+))?|([^:]+)(?::(\d+))?", hostport)
+    if not m:
+        return [first]
+    host, port = m.group(1) or m.group(3), m.group(2) or m.group(4)
+    return (["-p", port] if port else []) + [f"{user}@{host}" if user else host]
+
+
+def shell_target(args, host):
+    """What `pew shell` needs from ssh -G for ssh ARGS (options, then the
+    destination): (config, proxied, check). check is (hostname, port, via)
+    for the first host ssh actually dials, following ProxyJump back to its
+    first hop (via names that hop), or None when there's no knowing:
+    a ProxyCommand, or ssh -G failing."""
+    config = ssh_effective_config(args, host)
+    if config is None:
+        return {}, False, None
+    proxied = (config.get("proxyjump", "none") != "none"
+               or config.get("proxycommand", "none") != "none")
+    hop, via = config, None
+    for _ in range(8):  # a jump chain this long is surely a loop
+        if hop.get("proxyjump", "none") != "none":
+            args = parse_jump(hop["proxyjump"])
+            via = args[-1].rpartition("@")[2]
+            hop = ssh_effective_config(args, via)
+            if hop is None:
+                return config, proxied, None
+            continue
+        if hop.get("proxycommand", "none") != "none":
+            return config, proxied, None
+        return config, proxied, (hop.get("hostname") or host, int(hop.get("port") or 22), via)
+    return config, proxied, None
+
+
+def probe_ssh(hostname, port):
+    """None if hostname:port answers with an SSH banner, else why not:
+    an open port alone could be socket activation, a NAT or a console
+    proxy, with no sshd ready behind it yet."""
+    try:
+        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except (socket.gaierror, UnicodeError):
+        return "unresolved"
+    reason = "timeout"
+    for family, kind, proto, _, sockaddr in infos[:2]:
+        with socket.socket(family, kind, proto) as s:
+            s.settimeout(SHELL_CONNECT_TIMEOUT)
+            try:
+                s.connect(sockaddr)
+            except socket.timeout:
+                reason = "timeout"
+                continue
+            except ConnectionRefusedError:
+                reason = "refused"
+                continue
+            except OSError as e:
+                reason = ("no route" if e.errno in (errno.EHOSTUNREACH, errno.ENETUNREACH)
+                          else (e.strerror or str(e)).lower())
+                continue
+            s.settimeout(SHELL_BANNER_TIMEOUT)
+            try:
+                banner = s.recv(256)
+            except OSError:
+                banner = b""
+            if banner.startswith(b"SSH-"):
+                return None
+            reason = "open, but no ssh banner"
+    return reason
+
+
+def status_line(text):
+    """Rewrite the current stderr line with text, cut to the terminal."""
+    try:
+        cols = os.get_terminal_size(sys.stderr.fileno()).columns
+    except OSError:
+        cols = 80
+    sys.stderr.write("\r\033[2K" + text[:max(cols - 1, 1)])
+    sys.stderr.flush()
+
+
+def clear_status_line():
+    sys.stderr.write("\r\033[2K")
+    sys.stderr.flush()
+
+
+def wait_for_ssh(host, check, opts):
+    """Return once check's (hostname, port) answers with an SSH banner,
+    spinning on stderr while it doesn't. True if it had to wait (any
+    attempt failed), for the bell. Each attempt runs in a thread so the
+    spinner keeps turning through a slow connect; one that succeeds within
+    SHELL_SPINNER_DELAY shows nothing."""
+    hostname, port, via = check
+    name = via or host
+    detail = ([hostname] if hostname != name else []) + ([f"first hop for {host}"] if via else [])
+    label = name + (f" ({', '.join(detail)})" if detail else "")
+    style = load_pewrc().get("pretty_style", "unicode")
+    spin = PRETTY_STYLES.get(style, PRETTY_STYLES["unicode"])["spin"]
+    tty = sys.stderr.isatty()
+    start = time.monotonic()
+    state = {"shown": False, "frame": 0, "last": "checking", "failed": False}
+
+    def draw():
+        if tty:
+            elapsed = format_elapsed(time.monotonic() - start)
+            status_line(f"{spin[state['frame'] % len(spin)]} waiting for {label} to open "
+                        f"tcp/{port} · {elapsed} · {state['last']}")
+            state["frame"] += 1
+        elif not state["shown"]:
+            err(f"{PROG}: waiting for {label} to open tcp/{port}")
+        state["shown"] = True
+
+    try:
+        while True:
+            attempt_start = time.monotonic()
+            result = []
+            t = threading.Thread(target=lambda: result.append(probe_ssh(hostname, port)),
+                                 daemon=True)
+            t.start()
+            while t.is_alive():
+                t.join(0.1)
+                if t.is_alive() and time.monotonic() - start >= SHELL_SPINNER_DELAY:
+                    draw()
+            if result[0] is None:
+                break
+            state["last"], state["failed"] = result[0], True
+            debug(f"{label} tcp/{port}: {result[0]}")
+            if opts.wait_timeout and time.monotonic() - start >= opts.wait_timeout:
+                if tty and state["shown"]:
+                    clear_status_line()
+                die(f"gave up waiting for {label} to open tcp/{port} after "
+                    f"{format_elapsed(time.monotonic() - start)} ({result[0]})")
+            while time.monotonic() < attempt_start + SHELL_RETRY_EVERY:
+                draw()
+                time.sleep(0.1)
+    finally:
+        if tty and state["shown"]:
+            clear_status_line()
+    if state["failed"]:
+        err(f"{PROG}: {name} is up after {format_elapsed(time.monotonic() - start)}")
+    return state["failed"]
+
+
+def shell_countdown(message, verb, seconds):
+    """message, then `<verb> in N...` counting down on stderr. Enter cuts
+    it short; Ctrl-C raises KeyboardInterrupt as usual."""
+    tty = sys.stderr.isatty()
+    if not tty:
+        err(f"{PROG}: {message}, {verb} in {seconds:g}s")
+    end = time.monotonic() + seconds
+    with cbreak_stdin() as fd:
+        try:
+            while (left := end - time.monotonic()) > 0:
+                if tty:
+                    status_line(f"{message} · {verb} in {math.ceil(left)}...")
+                if fd is None:
+                    time.sleep(min(0.1, left))
+                elif select.select([fd], [], [], min(0.1, left))[0]:
+                    if any(c in os.read(fd, 64) for c in b"\r\n"):
+                        break
+        finally:
+            if tty:
+                clear_status_line()
+
+
+def run_ssh(argv):
+    """Run ssh as a child, standing in for it the way exec used to: ssh
+    owns the terminal and its exit code is ours. Returns (rc, hung_up).
+
+    While it runs, Ctrl-C and Ctrl-\\ belong to ssh (pew ignores them; only
+    after ssh has started, so ssh doesn't inherit that); SIGTERM and SIGHUP
+    are passed on. When ssh suspends itself (~^Z), pew stops too, so the
+    shell that started it gets the prompt back; `fg` continues both. pew
+    ignores SIGTSTP itself for the same reason: a Ctrl-Z before ssh has
+    the terminal in raw mode stops ssh, and pew follows. The terminal's
+    settings are put back afterwards, in case ssh died without doing it."""
+    saved = None
+    if sys.stdin.isatty():
+        import termios
+        try:
+            saved = termios.tcgetattr(sys.stdin.fileno())
+        except termios.error:
+            saved = None
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        proc = subprocess.Popen(argv)
+    except FileNotFoundError:
+        die("ssh not found on PATH")
+    hung_up = []
+
+    def forward(sig, _frame):
+        if sig == signal.SIGHUP:
+            hung_up.append(True)
+        proc.send_signal(sig)
+
+    handlers = {signal.SIGINT: signal.SIG_IGN, signal.SIGQUIT: signal.SIG_IGN,
+                signal.SIGTSTP: signal.SIG_IGN, signal.SIGTERM: forward,
+                signal.SIGHUP: forward}
+    old = {sig: signal.signal(sig, h) for sig, h in handlers.items()}
+    try:
+        while True:
+            _, status = os.waitpid(proc.pid, os.WUNTRACED)
+            if os.WIFSTOPPED(status):
+                os.kill(os.getpid(), signal.SIGSTOP)
+                proc.send_signal(signal.SIGCONT)
+                continue
+            break
+    finally:
+        for sig, h in old.items():
+            signal.signal(sig, h)
+        if saved is not None:
+            import termios
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved)
+            except termios.error:
+                pass
+    rc = os.waitstatus_to_exitcode(status)
+    proc.returncode = rc
+    return (128 - rc if rc < 0 else rc), bool(hung_up)
+
+
+def shell_flag(cli_value, key, default):
+    """--x/--no-x > ~/.pewrc [key=] > default."""
+    if cli_value is not None:
+        return cli_value
+    value = load_pewrc().get(key, "").lower()
+    if value in TRUTHY:
+        return True
+    if value in FALSY:
+        return False
+    return default
+
+
 def do_shell(host, command, opts):
-    """Replace this process with ssh to host, so ssh owns the terminal,
-    signals, and exit code outright. With a command, -t forces a TTY for
-    it (the thing `run`, which captures output, can't give you)."""
-    argv = ssh_argv(host, opts, munge_user=not opts.no_munge_username)
+    """ssh to host, as a child process (see run_ssh). First, unless
+    --no-wait, wait for the first host ssh dials (the host itself, or the
+    first ProxyJump hop) to answer on its ssh port, so `pes` can be started
+    while a machine reboots. With --persist, every session that ends, for
+    whatever reason, is followed by a countdown and a reconnect, until
+    Ctrl-C at the countdown or the wait; after SHELL_FAST_FAIL_LIMIT quick
+    ones in a row (under SHELL_FAST_FAIL seconds each) the countdown backs
+    off, doubling up to SHELL_BACKOFF_MAX. Without it, only ssh exiting
+    255 (couldn't connect) within SHELL_FAST_FAIL seconds through a proxy
+    is retried, since the host behind the jump may not be up yet, and
+    SHELL_FAST_FAIL_LIMIT of those in a row give up (a rejected key fails
+    fast every time). With a command, -t forces a TTY for it (the thing
+    `run`, which captures output, can't give you). What it's doing is
+    always said on stderr, no -v needed: this is the interactive one."""
+    wait = shell_flag(opts.wait, "wait", True)
+    persist = shell_flag(opts.persist, "persist", False)
+    bell = shell_flag(opts.bell, "bell", True)
+    base = ssh_argv(host, opts, munge_user=not opts.no_munge_username)
+    config, proxied, check = ({}, False, None) if opts.dry_run else shell_target(base[1:], host)
+    if persist and config.get("serveraliveinterval", "0") == "0":
+        # A silent drop (Wi-Fi gone, VPN flap) is noticed in ~15s, not
+        # minutes. Skipped if ~/.ssh/config or the inventory sets its own.
+        base = base[:-1] + SHELL_KEEPALIVE + base[-1:]
+    argv = base
     if command:
         argv = argv[:1] + ["-t"] + argv[1:] + substitute(command, host)
     if opts.dry_run:
         print(shlex.join(argv))
         return 0
     debug_cmd(argv)
-    sys.stdout.flush()
-    sys.stderr.flush()
+
+    fast_fails = 0
+    dropped = False
+    last_rc = None
     try:
-        os.execvp(argv[0], argv)
-    except FileNotFoundError:
-        die("ssh not found on PATH")
+        while True:
+            waited = wait_for_ssh(host, check, opts) if wait and check else False
+            if bell and (waited or dropped):
+                sys.stderr.write("\a")
+            started = time.monotonic()
+            rc, hung_up = run_ssh(argv)
+            last_rc = rc
+            took = time.monotonic() - started
+            if hung_up:
+                return rc
+            fast = took < SHELL_FAST_FAIL
+            fast_fails = fast_fails + 1 if fast else 0
+            how = f"exit {rc} after {format_elapsed(took)}"
+            if persist:
+                what = "was disconnected" if rc == 255 else "ended"
+                quick = f", quick failure {fast_fails} in a row" if fast else ""
+                err(f"{PROG}: session to {host} {what} ({how}{quick})")
+                delay = opts.persist_delay
+                if fast_fails >= SHELL_FAST_FAIL_LIMIT:
+                    delay = min(SHELL_BACKOFF_MAX, delay * 2 ** (fast_fails - SHELL_FAST_FAIL_LIMIT + 1))
+                    err(f"{PROG}: {fast_fails} sessions in a row ended within "
+                        f"{SHELL_FAST_FAIL:g}s, backing off to {delay:g}s between tries")
+                shell_countdown("Ctrl-C to exit, Enter to reconnect now", "reconnecting", delay)
+                # Bell when a session that had been up is back, not on each
+                # quick retry.
+                dropped = not fast
+                continue
+            if rc != 255 or not (fast and proxied):
+                return rc
+            through = f" through {check[2]}" if check and check[2] else ""
+            err(f"{PROG}: couldn't connect to {host}{through} ({how}), quick failure "
+                f"{fast_fails} of {SHELL_FAST_FAIL_LIMIT}")
+            if fast_fails >= SHELL_FAST_FAIL_LIMIT:
+                warn(f"giving up on {host}: ssh failed {fast_fails} times in a row, "
+                     f"each within {SHELL_FAST_FAIL:g}s")
+                return rc
+            shell_countdown("Ctrl-C to exit, Enter to retry now", "retrying",
+                            SHELL_PROXY_RETRY_DELAY)
+            dropped = False
+    except KeyboardInterrupt:
+        if last_rc is None:
+            raise
+        err("")
+        err(f"{PROG}: exiting (last session: exit {last_rc})")
+        return last_rc
 
 
 # ---------------------------------------------------------------------------
@@ -2002,7 +2318,13 @@ def ssh_config(host, opts):
     """ssh's effective config for host, from `ssh -G`: the inventory's
     rendered connection options plus ~/.ssh/config, as ssh itself would
     apply them. Parses config only, never connects. None if ssh fails."""
-    argv = ["ssh", "-G"] + ssh_options(host, opts) + [remote_spec(host, opts)]
+    return ssh_effective_config(ssh_options(host, opts) + [remote_spec(host, opts)], host)
+
+
+def ssh_effective_config(args, label):
+    """`ssh -G ARGS` (options, then the destination) as {key: value}, keys
+    lowercased. None if ssh fails."""
+    argv = ["ssh", "-G"] + args
     debug_cmd(argv)
     try:
         proc = subprocess.run(argv, capture_output=True, text=True,
@@ -2010,7 +2332,7 @@ def ssh_config(host, opts):
     except FileNotFoundError:
         die("ssh not found on PATH")
     if proc.returncode != 0:
-        debug_block(f"ssh -G {host} stderr", proc.stderr)
+        debug_block(f"ssh -G {label} stderr", proc.stderr)
         return None
     config = {}
     for line in proc.stdout.splitlines():
@@ -2694,7 +3016,7 @@ def build_parser():
     inventory_parent.add_argument(
         "--pewrc", metavar="PATH",
         help="Use PATH instead of ~/.pewrc for inventory=/ansible_config=/"
-             "hosts_default=/timestamp_format=/extra_vars=/color=/pretty=/tty=/sort=/slow=/scale= "
+             "hosts_default=/timestamp_format=/extra_vars=/color=/pretty=/tty=/sort=/slow=/scale=/wait=/persist=/bell= "
              "overrides. "
              "Same as "
              "$PEW_PEWRC, which this takes precedence over.",
@@ -3027,6 +3349,43 @@ def build_parser():
              "which suit scripted runs but not an interactive session.",
     )
     shell_p.add_argument(
+        "--no-wait", dest="wait", action="store_false", default=None,
+        help="Don't wait for the ssh port first; connect straight away. "
+             "Default from ~/.pewrc's wait=, else wait: if the first host ssh "
+             "dials (the host, or its first ProxyJump hop) doesn't answer "
+             "with an SSH banner, show a spinner and retry until it does, "
+             "then connect. For starting a shell while a host reboots.",
+    )
+    shell_p.add_argument(
+        "--wait-timeout", type=float, default=None, metavar="SECONDS",
+        help="Give up waiting for the ssh port after SECONDS (default: wait "
+             "until Ctrl-C)",
+    )
+    persist_mode = shell_p.add_mutually_exclusive_group()
+    persist_mode.add_argument(
+        "--persist", action="store_true", default=None,
+        help="Whenever the session ends, for any reason (a network drop, a "
+             "remote reboot, ~., or exit/logout/Ctrl-D), count down "
+             "--persist-delay seconds, then wait for the host and reconnect. "
+             "Ctrl-C during the countdown or the wait is the way out. Quick "
+             "failures back off, up to a minute between tries. Adds ssh "
+             "keepalives so a silent drop is noticed. Default from ~/.pewrc's "
+             "persist=yes.",
+    )
+    persist_mode.add_argument(
+        "--no-persist", dest="persist", action="store_false",
+        help="Don't reconnect, overriding ~/.pewrc's persist=",
+    )
+    shell_p.add_argument(
+        "--persist-delay", type=float, default=5.0, metavar="SECONDS",
+        help="Countdown before --persist reconnects (default: 5; Enter skips it)",
+    )
+    shell_p.add_argument(
+        "--no-bell", dest="bell", action="store_false", default=None,
+        help="Don't ring the terminal bell when a host comes up after a wait "
+             "or a reconnect. Default from ~/.pewrc's bell=.",
+    )
+    shell_p.add_argument(
         "target", nargs="?", metavar="HOST",
         help="Ansible host pattern that must resolve to exactly one host "
              "(same as --hosts). A plain name matching nothing falls back to "
@@ -3118,7 +3477,7 @@ def expand_subcommand(word, names):
 
 
 def main():
-    global VERBOSE, DEBUG, PEWRC_PATH, LIVE
+    global VERBOSE, DEBUG, PEWRC_PATH, LIVE, PROG
     live = None
     try:
         parser = build_parser()
@@ -3128,6 +3487,8 @@ def main():
         # subcommand is always argv[0], the top-level parser has no options.
         argv = sys.argv[1:]
         prog_name = os.path.basename(sys.argv[0])
+        if prog_name in PROG_ALIASES:
+            PROG = prog_name  # messages say pes:/per:/pez:, usage still says pew
         argv[0:0] = PROG_ALIASES.get(prog_name, [])
         if argv:
             argv[0] = expand_subcommand(argv[0], parser.subcommands)

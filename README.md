@@ -185,7 +185,7 @@ Pass `--pewrc PATH` (or set `$PEW_PEWRC`; `--pewrc` wins if both are
 set) to use a different rc file entirely — it replaces `~/.pewrc` for
 every setting on this page (`inventory=`, `ansible_config=`,
 `hosts_default=`, `timestamp_format=`, `extra_vars=`, `color=`, `pretty=`,
-`pretty_style=`, `tty=`, `sort=`, `slow=`, `scale=`). Useful for per-project config,
+`pretty_style=`, `tty=`, `sort=`, `slow=`, `scale=`, `wait=`, `persist=`, `bell=`). Useful for per-project config,
 or for testing.
 
 ### What about the rest of `ansible.cfg`?
@@ -1046,13 +1046,84 @@ pew shell alpha                      # login shell on alpha.example.com
 pew shell alpha -e connect_via_tailnet=true
 pew shell alpha --root -- htop       # run one command, with a TTY
 pew shell -l 'web:&staging' --where ansible_hostname=web3
+pes alpha --persist -- tmux new -A -s main   # survives drops and reboots
 ```
 
 `shell` connects the same way every other subcommand does (see **How
 pew connects to each host**), then hands your terminal over to `ssh`
-completely — `pew` replaces itself with the `ssh` process, so job
-control, window resizing and Ctrl-C behave exactly as with plain `ssh`,
-and `ssh`'s exit code is `pew`'s exit code.
+completely. `ssh` runs as a child of `pew`, and job control (`~^Z`,
+`fg`), window resizing and Ctrl-C behave exactly as with plain `ssh`.
+`ssh`'s exit code is `pew`'s exit code.
+
+**Waiting for a host that's rebooting:** before connecting, `shell`
+checks that the host answers on its ssh port with an SSH banner, not
+just an open port. If it doesn't, `shell` shows a spinner and retries
+about once a second until it does, then connects:
+
+```
+⠹ waiting for web1 (10.0.4.12) to open tcp/22 · 1m12s · refused
+pew: web1 is up after 1m14s
+```
+
+The end of the line is why the last attempt failed: `refused`,
+`no route`, `timeout`, `unresolved`, or `open, but no ssh banner`. When
+the host is already up, which is the usual case, there's no visible
+delay and nothing is printed. The address and port come from `ssh -G`,
+so they're what `ssh` itself dials, `~/.ssh/config` included.
+Through a `ProxyJump`, the check is on the first hop, the host your
+machine actually connects to. With a `ProxyCommand` there's nothing to
+check, so it connects straight away. Each attempt allows 2s to connect,
+so slow links still get through. `--wait-timeout SECONDS` gives up after
+that long (exit 1). `--no-wait`, or `wait=no` in `~/.pewrc`, skips the
+check entirely.
+
+The terminal bell rings when the host comes up after a wait or after a
+reconnect, so a tab or tmux window flags itself. Going straight in to a
+host that's up never rings. `--no-bell` or `bell=no` turns it off.
+
+`shell` is the interactive one, so it always says what it's doing on
+stderr, no `-v` needed. Its messages start with the name you called it
+by, so `pes: ...` under `pes`.
+
+**Retrying through a jump host:** when `ssh` exits 255 (its
+couldn't-connect code) within 10 seconds on a host reached through a
+`ProxyJump` or `ProxyCommand`, `shell` retries after a 2-second
+countdown. The jump host being up doesn't mean the VM behind it is.
+Each failure is reported (`pes: couldn't connect to vm3 through hive1
+(exit 255 after 0.4s), quick failure 1 of 3`). Press Enter to retry now,
+or Ctrl-C to stop. After 3 quick failures in a row it gives up, since a
+rejected key or a host-key mismatch fails fast every time.
+
+**`--persist` — keep reconnecting:** whenever the session ends, for any
+reason, `shell` says how it ended, counts down, and reconnects, waiting
+for the host first:
+
+```
+pes: session to web1 was disconnected (exit 255 after 1h12m)
+Ctrl-C to exit, Enter to reconnect now · reconnecting in 4...
+```
+
+A network drop, a remote `reboot`, the `~.` escape, and leaving with
+`exit`, `logout` or Ctrl-D all reconnect. The way out is Ctrl-C during
+the countdown, or during the wait for the host. `shell` then exits with
+the last session's exit code. The countdown is `--persist-delay
+SECONDS`, 5 by default. `persist=yes` in `~/.pewrc` makes it the
+default, and `--no-persist` turns it off for a run.
+
+A session that ends within 10 seconds counts as a quick failure, and
+each one says so. After 3 in a row, the countdown backs off, doubling
+each time up to a minute between tries
+(`pes: 3 sessions in a row ended within 10s, backing off to 10s between
+tries`). One that lasts longer resets it.
+
+`--persist` also adds `ServerAliveInterval=5` and `ServerAliveCountMax=3`,
+so a silent drop (Wi-Fi gone, a VPN flap) is noticed in about 15 seconds
+instead of minutes. If the inventory or `~/.ssh/config` sets its own
+`ServerAliveInterval`, that's left alone.
+
+Pair it with tmux or screen on the remote side (`pes web1 --persist --
+tmux new -A -s main`), and every reconnect drops you back into the same
+session.
 
 The host is given as a positional `HOST` or with `--hosts`/`-l` (not
 both), and is an ordinary Ansible pattern — but after `--where`

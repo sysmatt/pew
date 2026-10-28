@@ -39,6 +39,7 @@ SCRIPTS=(
     21_controller_side_facts.sh
     22_run_tty.sh
     23_ping.sh
+    24_shell_wait.sh
 )
 $SKIP_STRESS || SCRIPTS+=(stress_10.sh)
 
