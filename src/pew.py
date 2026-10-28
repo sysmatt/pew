@@ -73,12 +73,12 @@ def err(text):
 
 
 def die(msg, code=1):
-    err(f"{PROG}: error: {msg}")
+    say("error", msg)
     sys.exit(code)
 
 
 def warn(msg):
-    err(f"{PROG}: warning: {msg}")
+    say("warning", msg)
 
 
 # ---------------------------------------------------------------------------
@@ -87,8 +87,75 @@ def warn(msg):
 
 GREEN = "\033[32m"
 RED = "\033[31m"
+AMBER = "\033[33m"
+BOLD = "\033[1m"
+REVERSE = "\033[7m"
+CYAN = "\033[36m"
+DIM = "\033[2m"
 RESET = "\033[0m"
 TRUTHY = {"1", "yes", "true", "on"}
+
+# Styled messages: an icon and color per kind of message, the words that
+# matter highlighted. Set in main() when stderr is a terminal (and no
+# $NO_COLOR), for `shell` only so far; off, every message is the plain
+# `pew: ...` text it always was, so pipes and logs see no escapes. The
+# icons are all single-column, for status_line()'s width math.
+FANCY = False
+SAY_KINDS = {  # kind: (icon, color, label)
+    "error": ("✘", RED + BOLD, "error:"),
+    "warning": ("▲", AMBER + BOLD, "warning:"),
+    "info": ("›", CYAN, None),
+    "ok": ("✔", GREEN + BOLD, None),
+    "fail": ("✘", RED, None),
+    "session": ("●", CYAN, None),
+    "retry": ("↻", AMBER + BOLD, None),
+    "exit": ("■", DIM, None),
+    "debug": (None, DIM, "debug:"),
+}
+
+
+def style(text, codes):
+    return f"{codes}{text}{RESET}" if FANCY and codes else str(text)
+
+
+def hl_host(host):
+    return style(host, BOLD)
+
+
+def hl_num(value):
+    """A count or a duration."""
+    return style(value, BOLD)
+
+
+def hl_rc(rc):
+    return style(rc, (GREEN if rc == 0 else RED) + BOLD)
+
+
+def key_hint(key, action):
+    """`Enter to retry now`, or styled: the key as a reverse-video cap."""
+    return f"{style(f' {key} ', REVERSE)} {action}" if FANCY else f"{key} to {action}"
+
+
+def say_prefix(kind):
+    """`pew: ` plus, styled, the kind's icon and label."""
+    icon, color, label = SAY_KINDS[kind]
+    if not FANCY:
+        return f"{PROG}: " + (f"{label} " if label else "")
+    head = " ".join(x for x in (icon, label) if x)
+    return f"{style(PROG + ':', DIM)} {style(head, color)} "
+
+
+def say(kind, msg):
+    """One message on stderr. Styled, a debug line is dimmed whole, and a
+    message's continuation lines are indented under its first word."""
+    prefix = say_prefix(kind)
+    if FANCY:
+        if kind == "debug":
+            msg = style(msg, DIM)
+        icon, _, label = SAY_KINDS[kind]
+        width = len(PROG) + 2 + len(" ".join(x for x in (icon, label) if x)) + 1
+        msg = msg.replace("\n", "\n" + " " * width)
+    err(prefix + msg)
 
 
 def paint(text, rc, enabled):
@@ -126,9 +193,6 @@ def failure_detail(rc, note):
 # they finish and replaced by one final status line. Everything printed
 # while it's up goes through out()/err(), which put it above the footer.
 # ---------------------------------------------------------------------------
-
-CYAN = "\033[36m"
-DIM = "\033[2m"
 
 # "unicode" sticks to single-column characters so the footer's cursor math
 # holds in any terminal; "emoji" is prettier but double-width, which some
@@ -448,28 +512,28 @@ DEBUG = False
 
 def info(msg):
     if VERBOSE or DEBUG:
-        err(f"{PROG}: {msg}")
+        say("info", msg)
 
 
 def debug(msg):
     if DEBUG:
-        err(f"{PROG}: debug: {msg}")
+        say("debug", msg)
 
 
 def debug_cmd(cmd):
     if DEBUG:
-        err(f"{PROG}: debug: + {shlex.join(cmd)}")
+        say("debug", f"+ {shlex.join(cmd)}")
 
 
 def debug_json(label, data):
     if DEBUG:
-        err(f"{PROG}: debug: {label}:")
+        say("debug", f"{label}:")
         err(json.dumps(data, indent=2, sort_keys=True))
 
 
 def debug_block(label, text):
     if DEBUG and text and text.strip():
-        err(f"{PROG}: debug: {label}:")
+        say("debug", f"{label}:")
         err(text.rstrip())
 
 
@@ -1811,11 +1875,8 @@ def match_plain_name(name, inventory):
     needle = name.lower()
     short = [h for h in all_hosts if h.lower().startswith(needle + ".")]
     if short:
-        info(f"{name!r} matched {len(short)} host(s) as a short name")
         return short
-    substring = [h for h in all_hosts if needle in h.lower()]
-    info(f"{name!r} matched {len(substring)} host(s) as a substring")
-    return substring
+    return [h for h in all_hosts if needle in h.lower()]
 
 
 def resolve_shell_host(pattern, opts):
@@ -1834,11 +1895,11 @@ def resolve_shell_host(pattern, opts):
     if opts.where:
         hosts = filter_by_where(hosts, opts.where, opts)
     if len(hosts) != 1:
-        listing = "\n".join(f"  {h}" for h in hosts)
+        listing = "\n".join(f"  {hl_host(h)}" for h in hosts)
         die(f"{pattern!r} matched {len(hosts)} hosts; shell needs exactly one:\n"
             f"{listing}\nnarrow the pattern (or use --where) to a single host")
     if fuzzy:
-        print(f"{PROG}: {pattern} → {hosts[0]}", file=sys.stderr)
+        say("info", f"{pattern} → {hl_host(hosts[0])}")
     return hosts[0]
 
 
@@ -1870,13 +1931,15 @@ def parse_jump(spec):
 
 def shell_target(args, host):
     """What `pew shell` needs from ssh -G for ssh ARGS (options, then the
-    destination): (config, proxied, check). check is (hostname, port, via)
-    for the first host ssh actually dials, following ProxyJump back to its
-    first hop (via names that hop), or None when there's no knowing:
-    a ProxyCommand, or ssh -G failing."""
+    destination): (config, proxied, check, why). check is (hostname, port,
+    via) for the first host ssh actually dials, following ProxyJump back to
+    its first hop (via names that hop), or None when there's no knowing,
+    and then why is (say kind, message) saying so: a ProxyCommand is
+    normal, ssh -G failing isn't."""
+    blind = "connecting without waiting for the port"
     config = ssh_effective_config(args, host)
     if config is None:
-        return {}, False, None
+        return {}, False, None, ("warning", f"ssh -G failed for {hl_host(host)}, {blind}")
     proxied = (config.get("proxyjump", "none") != "none"
                or config.get("proxycommand", "none") != "none")
     hop, via = config, None
@@ -1886,12 +1949,15 @@ def shell_target(args, host):
             via = args[-1].rpartition("@")[2]
             hop = ssh_effective_config(args, via)
             if hop is None:
-                return config, proxied, None
+                return config, proxied, None, (
+                    "warning", f"ssh -G failed for jump host {hl_host(via)}, {blind}")
             continue
         if hop.get("proxycommand", "none") != "none":
-            return config, proxied, None
-        return config, proxied, (hop.get("hostname") or host, int(hop.get("port") or 22), via)
-    return config, proxied, None
+            return config, proxied, None, (
+                "info", f"{hl_host(via or host)} uses a ProxyCommand, nothing to check, connecting")
+        return config, proxied, (hop.get("hostname") or host, int(hop.get("port") or 22), via), None
+    return config, proxied, None, ("warning", f"ProxyJump chain for {hl_host(host)} "
+                                              f"looks like a loop, {blind}")
 
 
 def probe_ssh(hostname, port):
@@ -1929,13 +1995,24 @@ def probe_ssh(hostname, port):
     return reason
 
 
+ANSI_RE = re.compile(r"(\033\[[0-9;?]*[A-Za-z])")
+
+
 def status_line(text):
-    """Rewrite the current stderr line with text, cut to the terminal."""
+    """Rewrite the current stderr line with text, cut to the terminal
+    (counting only what's visible: escapes take no columns)."""
     try:
         cols = os.get_terminal_size(sys.stderr.fileno()).columns
     except OSError:
         cols = 80
-    sys.stderr.write("\r\033[2K" + text[:max(cols - 1, 1)])
+    room, kept = max(cols - 1, 1), []
+    for part in ANSI_RE.split(text):
+        if ANSI_RE.fullmatch(part):
+            kept.append(part)
+        elif room > 0:
+            kept.append(part[:room])
+            room -= len(part[:room])
+    sys.stderr.write("\r\033[2K" + "".join(kept) + (RESET if FANCY else ""))
     sys.stderr.flush()
 
 
@@ -1953,9 +2030,9 @@ def wait_for_ssh(host, check, opts):
     hostname, port, via = check
     name = via or host
     detail = ([hostname] if hostname != name else []) + ([f"first hop for {host}"] if via else [])
-    label = name + (f" ({', '.join(detail)})" if detail else "")
-    style = load_pewrc().get("pretty_style", "unicode")
-    spin = PRETTY_STYLES.get(style, PRETTY_STYLES["unicode"])["spin"]
+    label = hl_host(name) + (f" ({', '.join(detail)})" if detail else "")
+    pretty_style = load_pewrc().get("pretty_style", "unicode")
+    spin = PRETTY_STYLES.get(pretty_style, PRETTY_STYLES["unicode"])["spin"]
     tty = sys.stderr.isatty()
     start = time.monotonic()
     state = {"shown": False, "frame": 0, "last": "checking", "failed": False}
@@ -1963,11 +2040,13 @@ def wait_for_ssh(host, check, opts):
     def draw():
         if tty:
             elapsed = format_elapsed(time.monotonic() - start)
-            status_line(f"{spin[state['frame'] % len(spin)]} waiting for {label} to open "
-                        f"tcp/{port} · {elapsed} · {state['last']}")
+            icon = style(spin[state["frame"] % len(spin)], AMBER + BOLD)
+            prefix = f"{style(PROG + ':', DIM)} " if FANCY else ""
+            status_line(f"{prefix}{icon} waiting for {label} to open tcp/{port} · "
+                        f"{hl_num(elapsed)} · {style(state['last'], DIM)}")
             state["frame"] += 1
         elif not state["shown"]:
-            err(f"{PROG}: waiting for {label} to open tcp/{port}")
+            say("info", f"waiting for {label} to open tcp/{port}")
         state["shown"] = True
 
     try:
@@ -1983,6 +2062,17 @@ def wait_for_ssh(host, check, opts):
                     draw()
             if result[0] is None:
                 break
+            if result[0] != state["last"] and (VERBOSE or DEBUG):
+                # The reason changing is the boot progressing (no route,
+                # then refused, then a banner), worth keeping on screen.
+                if not state["shown"]:
+                    draw()  # the waiting line first
+                if tty:
+                    clear_status_line()
+                change = (f"{state['last']} → {result[0]} at "
+                          f"{hl_num(format_elapsed(time.monotonic() - start))}"
+                          if state["failed"] else result[0])
+                info(f"{hl_host(name)} tcp/{port}: {change}")
             state["last"], state["failed"] = result[0], True
             debug(f"{label} tcp/{port}: {result[0]}")
             if opts.wait_timeout and time.monotonic() - start >= opts.wait_timeout:
@@ -1997,22 +2087,24 @@ def wait_for_ssh(host, check, opts):
         if tty and state["shown"]:
             clear_status_line()
     if state["failed"]:
-        err(f"{PROG}: {name} is up after {format_elapsed(time.monotonic() - start)}")
+        say("ok", f"{hl_host(name)} is up after {hl_num(format_elapsed(time.monotonic() - start))}")
     return state["failed"]
 
 
-def shell_countdown(message, verb, seconds):
-    """message, then `<verb> in N...` counting down on stderr. Enter cuts
-    it short; Ctrl-C raises KeyboardInterrupt as usual."""
+def shell_countdown(verb, action, seconds):
+    """`<verb> in N` counting down on stderr, with the keys: Enter (to
+    action) cuts it short; Ctrl-C raises KeyboardInterrupt as usual."""
     tty = sys.stderr.isatty()
+    keys = f"{key_hint('Enter', action)} · {key_hint('Ctrl-C', 'exit')}"
     if not tty:
-        err(f"{PROG}: {message}, {verb} in {seconds:g}s")
+        say("info", f"{verb} in {seconds:g}s · {keys}")
     end = time.monotonic() + seconds
     with cbreak_stdin() as fd:
         try:
             while (left := end - time.monotonic()) > 0:
                 if tty:
-                    status_line(f"{message} · {verb} in {math.ceil(left)}...")
+                    status_line(f"{say_prefix('retry')}{verb} in "
+                                f"{hl_num(math.ceil(left))} · {keys}")
                 if fd is None:
                     time.sleep(min(0.1, left))
                 elif select.select([fd], [], [], min(0.1, left))[0]:
@@ -2111,11 +2203,22 @@ def do_shell(host, command, opts):
     persist = shell_flag(opts.persist, "persist", False)
     bell = shell_flag(opts.bell, "bell", True)
     base = ssh_argv(host, opts, munge_user=not opts.no_munge_username)
-    config, proxied, check = ({}, False, None) if opts.dry_run else shell_target(base[1:], host)
+    config, proxied, check, why = (({}, False, None, None) if opts.dry_run
+                                   else shell_target(base[1:], host))
+    if why and wait and (why[0] == "warning" or VERBOSE or DEBUG):
+        say(*why)
     if persist and config.get("serveraliveinterval", "0") == "0":
         # A silent drop (Wi-Fi gone, VPN flap) is noticed in ~15s, not
         # minutes. Skipped if ~/.ssh/config or the inventory sets its own.
         base = base[:-1] + SHELL_KEEPALIVE + base[-1:]
+        info("adding ServerAliveInterval=5, ServerAliveCountMax=3 (a silent drop "
+             "is noticed in ~15s)")
+    elif persist:
+        info(f"keeping ServerAliveInterval={config['serveraliveinterval']} from ssh config")
+    address = config.get("hostname") or host
+    port = config.get("port") or "22"
+    through = (f" via {hl_host(check[2])}" if check and check[2]
+               else " via ProxyCommand" if config.get("proxycommand", "none") != "none" else "")
     argv = base
     if command:
         argv = argv[:1] + ["-t"] + argv[1:] + substitute(command, host)
@@ -2132,6 +2235,7 @@ def do_shell(host, command, opts):
             waited = wait_for_ssh(host, check, opts) if wait and check else False
             if bell and (waited or dropped):
                 sys.stderr.write("\a")
+            info(f"connecting to {hl_host(host)} ({address}:{port}){through}")
             started = time.monotonic()
             rc, hung_up = run_ssh(argv)
             last_rc = rc
@@ -2140,47 +2244,43 @@ def do_shell(host, command, opts):
                 return rc
             fast = took < SHELL_FAST_FAIL
             fast_fails = fast_fails + 1 if fast else 0
-            how = f"exit {rc} after {format_elapsed(took)}"
+            how = f"exit {hl_rc(rc)} after {hl_num(format_elapsed(took))}"
             if persist:
                 what = "was disconnected" if rc == 255 else "ended"
-                quick = f", quick failure {fast_fails} in a row" if fast else ""
-                err(f"{PROG}: session to {host} {what} ({how}{quick})")
+                quick = f" · quick failure {hl_num(fast_fails)} in a row" if fast else ""
+                say("session", f"session to {hl_host(host)} {what} · {how}{quick}")
                 delay = opts.persist_delay
                 if fast_fails >= SHELL_FAST_FAIL_LIMIT:
                     delay = min(SHELL_BACKOFF_MAX, delay * 2 ** (fast_fails - SHELL_FAST_FAIL_LIMIT + 1))
-                    err(f"{PROG}: {fast_fails} sessions in a row ended within "
-                        f"{SHELL_FAST_FAIL:g}s, backing off to {delay:g}s between tries")
-                shell_countdown("Ctrl-C to exit, Enter to reconnect now", "reconnecting", delay)
+                    warn(f"{hl_num(fast_fails)} sessions in a row ended within "
+                         f"{SHELL_FAST_FAIL:g}s, backing off to {hl_num(f'{delay:g}s')} between tries")
+                shell_countdown("reconnecting", "reconnect now", delay)
                 # Bell when a session that had been up is back, not on each
                 # quick retry.
                 dropped = not fast
                 continue
             if rc != 255 or not (fast and proxied):
                 return rc
-            through = f" through {check[2]}" if check and check[2] else ""
-            err(f"{PROG}: couldn't connect to {host}{through} ({how}), quick failure "
-                f"{fast_fails} of {SHELL_FAST_FAIL_LIMIT}")
+            through = f" through {hl_host(check[2])}" if check and check[2] else ""
+            say("fail", f"couldn't connect to {hl_host(host)}{through} · {how} · quick failure "
+                f"{hl_num(fast_fails)} of {SHELL_FAST_FAIL_LIMIT}")
             if fast_fails >= SHELL_FAST_FAIL_LIMIT:
-                warn(f"giving up on {host}: ssh failed {fast_fails} times in a row, "
+                warn(f"giving up on {hl_host(host)}: ssh failed {fast_fails} times in a row, "
                      f"each within {SHELL_FAST_FAIL:g}s")
                 return rc
-            shell_countdown("Ctrl-C to exit, Enter to retry now", "retrying",
-                            SHELL_PROXY_RETRY_DELAY)
+            shell_countdown("retrying", "retry now", SHELL_PROXY_RETRY_DELAY)
             dropped = False
     except KeyboardInterrupt:
         if last_rc is None:
             raise
         err("")
-        err(f"{PROG}: exiting (last session: exit {last_rc})")
+        say("exit", f"exiting · last session exit {hl_rc(last_rc)}")
         return last_rc
 
 
 # ---------------------------------------------------------------------------
 # ping
 # ---------------------------------------------------------------------------
-
-AMBER = "\033[33m"
-REVERSE = "\033[7m"
 
 PING_DEFAULT_SLOW_MS = 200.0
 PING_WINDOW = 20        # recent probes judged for amber (loss)
@@ -3477,7 +3577,7 @@ def expand_subcommand(word, names):
 
 
 def main():
-    global VERBOSE, DEBUG, PEWRC_PATH, LIVE, PROG
+    global VERBOSE, DEBUG, PEWRC_PATH, LIVE, PROG, FANCY
     live = None
     try:
         parser = build_parser()
@@ -3517,6 +3617,7 @@ def main():
             # No hosts_default= fallback: a shell names its target explicitly.
             if opts.target and opts.hosts:
                 die("give the host either as HOST or --hosts/-l, not both")
+            FANCY = sys.stderr.isatty() and "NO_COLOR" not in os.environ
             pattern = opts.target or opts.hosts
             if not pattern:
                 die("shell needs a HOST (or --hosts/-l)")

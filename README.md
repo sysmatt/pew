@@ -1061,8 +1061,8 @@ just an open port. If it doesn't, `shell` shows a spinner and retries
 about once a second until it does, then connects:
 
 ```
-⠹ waiting for web1 (10.0.4.12) to open tcp/22 · 1m12s · refused
-pew: web1 is up after 1m14s
+pes: ⠹ waiting for web1 (10.0.4.12) to open tcp/22 · 1m12s · refused
+pes: ✔ web1 is up after 1m14s
 ```
 
 The end of the line is why the last attempt failed: `refused`,
@@ -1083,14 +1083,28 @@ host that's up never rings. `--no-bell` or `bell=no` turns it off.
 
 `shell` is the interactive one, so it always says what it's doing on
 stderr, no `-v` needed. Its messages start with the name you called it
-by, so `pes: ...` under `pes`.
+by, so `pes: ...` under `pes`. On a terminal they're styled: an icon and
+color per kind of message (`✔` up, `●` a session ending, `↻` a
+countdown, `✘` a failure or error, `▲` a warning, `■` exiting), the
+hostname, durations and counts in bold, exit codes green for 0 and red
+otherwise, and the countdown's keys shown as key caps. A multi-line
+error is indented under its first line. With stderr piped or
+redirected, or `$NO_COLOR` set, the same messages come out as plain
+text with no icons.
+
+`-v` adds where it's connecting (`pes: › connecting to vm3 (10.77.0.3:22)
+via hive1`), each change in why the wait is failing, kept on screen as
+the boot progresses (`pes: › web1 tcp/22: no route → refused at 41.2s`),
+a note when a `ProxyCommand` host can't be checked first, and whether
+`--persist` added keepalives. If `ssh -G` fails, so there's no address
+to check, `shell` always warns that it's connecting without waiting.
 
 **Retrying through a jump host:** when `ssh` exits 255 (its
 couldn't-connect code) within 10 seconds on a host reached through a
 `ProxyJump` or `ProxyCommand`, `shell` retries after a 2-second
 countdown. The jump host being up doesn't mean the VM behind it is.
-Each failure is reported (`pes: couldn't connect to vm3 through hive1
-(exit 255 after 0.4s), quick failure 1 of 3`). Press Enter to retry now,
+Each failure is reported (`pes: ✘ couldn't connect to vm3 through hive1
+· exit 255 after 0.4s · quick failure 1 of 3`). Press Enter to retry now,
 or Ctrl-C to stop. After 3 quick failures in a row it gives up, since a
 rejected key or a host-key mismatch fails fast every time.
 
@@ -1099,8 +1113,8 @@ reason, `shell` says how it ended, counts down, and reconnects, waiting
 for the host first:
 
 ```
-pes: session to web1 was disconnected (exit 255 after 1h12m)
-Ctrl-C to exit, Enter to reconnect now · reconnecting in 4...
+pes: ● session to web1 was disconnected · exit 255 after 72m03s
+pes: ↻ reconnecting in 4 · [Enter] reconnect now · [Ctrl-C] exit
 ```
 
 A network drop, a remote `reboot`, the `~.` escape, and leaving with
@@ -1113,8 +1127,8 @@ default, and `--no-persist` turns it off for a run.
 A session that ends within 10 seconds counts as a quick failure, and
 each one says so. After 3 in a row, the countdown backs off, doubling
 each time up to a minute between tries
-(`pes: 3 sessions in a row ended within 10s, backing off to 10s between
-tries`). One that lasts longer resets it.
+(`pes: ▲ warning: 3 sessions in a row ended within 10s, backing off to
+10s between tries`). One that lasts longer resets it.
 
 `--persist` also adds `ServerAliveInterval=5` and `ServerAliveCountMax=3`,
 so a silent drop (Wi-Fi gone, a VPN flap) is noticed in about 15 seconds
@@ -1150,7 +1164,7 @@ inventory host, most specific first:
 The first of these that matches anything decides — so `web1` still
 finds `web1.example.com` even though `web10.example.com` also contains
 `web1`. `pew` says what it picked on stderr
-(`pew: web1 → web1.example.com`), and if the deciding match is
+(`pew: › web1 → web1.example.com`), and if the deciding match is
 ambiguous (say `pew shell router` with several routers), it aborts and
 lists them, same as above. These matches are on host names only, never
 group names. Only plain names (letters, digits, `.`, `-`, `_`) get the

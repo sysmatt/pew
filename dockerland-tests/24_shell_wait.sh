@@ -140,12 +140,12 @@ for _ in $(seq 80); do grep -q "session-3" "$LOCAL_TMP/persist.out" && break; sl
 for _ in $(seq 20); do kill -INT "$PEW_PID" 2>/dev/null || break; sleep 0.5; done
 wait "$PEW_PID"; rc=$?
 out="$(cat "$LOCAL_TMP/persist.out")"
-check "--persist: says a drop was a disconnect" "$out" "session to $HOST was disconnected (exit 255"
+check "--persist: says a drop was a disconnect" "$out" "session to $HOST was disconnected · exit 255"
 check "--persist: reconnects after a drop" "$out" "session-2"
-check "--persist: says a logout ended it" "$out" "session to $HOST ended (exit 0"
+check "--persist: says a logout ended it" "$out" "session to $HOST ended · exit 0"
 check "--persist: reconnects after a logout too" "$out" "session-3"
 check "--persist: bell on the way back" "$out" $'\a'
-check "--persist: Ctrl-C says it's exiting" "$out" "exiting (last session"
+check "--persist: Ctrl-C says it's exiting" "$out" "exiting · last session exit"
 kill "$PEW_PID" 2>/dev/null
 dt::exec "$UBUNTU" rm -f /tmp/pew-persist >/dev/null 2>&1
 
