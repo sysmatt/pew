@@ -69,6 +69,7 @@ check "proxied host skipped with a warning" "$out" \
     "skipped 1 proxied host(s): behind-bastion (via bastion.example.test)"
 check_not "proxied host isn't probed" "$out" "behind-bastion:"
 check "unresolvable name reported" "$out" "nowhere     : no-such-host.invalid unresolved"
+check "Hosts Up: lists repliers, comma-separated, sorted" "$out" "Hosts Up: lo1,lo1-alt,lo2,lo10"
 [ "$rc" -eq 1 ] && dt::pass "a host that never replied: exit 1" || dt::fail "unresolved: rc=$rc"
 
 out="$(HOME="$FAKE_HOME" "$DT_PEW" ping "${SARGS[@]}" behind-bastion 2>&1)"

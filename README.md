@@ -185,7 +185,7 @@ Pass `--pewrc PATH` (or set `$PEW_PEWRC`; `--pewrc` wins if both are
 set) to use a different rc file entirely — it replaces `~/.pewrc` for
 every setting on this page (`inventory=`, `ansible_config=`,
 `hosts_default=`, `timestamp_format=`, `extra_vars=`, `color=`, `pretty=`,
-`pretty_style=`, `tty=`, `sort=`, `slow=`). Useful for per-project config,
+`pretty_style=`, `tty=`, `sort=`, `slow=`, `scale=`). Useful for per-project config,
 or for testing.
 
 ### What about the rest of `ansible.cfg`?
@@ -951,20 +951,39 @@ pew ping all -c 5 -q         # 5 probes each, then just the summary
 ```
 
 ```
-pew ping · icmp · 4 target(s) · every 1s · 3m12s                ✔ 2  ◐ 1  ✘ 1
-db1.example.com                                     ✘    192    100%     ----
-········································································
-web1.example.com, web1-alt.example.com              ✔    192      0%    3.1ms
-▁▁▂▁▁▁▃▁▁▁▁▂▁▁▁▁▂▂▁▁▁▃▁▁▁▁▂▁▁▁▁▂▁▁▁▃▁▁▁▁▂▁▁▁▁▂▂▁▁▁▃▁▁▁▁▂▁▁▁▁▂▁▁▁▃▁▁▁▁▂▁
+pew ping · icmp · 4 target(s) · every 1s · 3m12s · graph 1m14s · scale 0–max  ✔ 2  ◐ 1  ✘ 1
+db1.example.com                                                 ✘    192    100%     ----
+      ··········································································
+web1.example.com, web1-alt.example.com                          ✔    192      0%    3.4ms
+3.6ms ▇█▇▇█▇▇▇█▇██▇▇█▇▇█▇▇█▇▇▇█▇██▇▇█▇▇█▇▇█▇▇▇█▇██▇▇█▇▇█▇▇█▇▇▇█▇██▇▇█▇▇█▇▇▇█▇
+    0 ██████████████████████████████████████████████████████████████████████████
 ...
-q quit · r reset                                 skipped, proxied: bastion-db
+q quit · r reset · s scale                                   skipped, proxied: bastion-db
 ```
 
 Each tile shows the hostname, then the number of probes, the loss so
 far and the last round trip, and under that a sparkline of recent round
-trips, newest at the right. A lost probe is a red `·`. Bars run from 0
-to the slowest round trip on screen, so a spike stands out and the
-steady state sits near the top.
+trips, newest at the right. A lost probe is a red `·`. The header says
+how much time the sparklines cover (`graph 1m14s`: their width in
+probes times `--interval`).
+
+Each sparkline scales on its own, to the round trips it's showing, and
+its left-hand gutter labels the top and bottom of that scale. On graphs
+two or more rows tall, an amber `┈` in the gutter marks where the slow
+threshold falls, when it's within the range shown. There are three
+scales. `s` cycles through them while it runs, and `--scale` or
+`scale=` in `~/.pewrc` picks the one it starts with:
+
+- **`zero`** (the default, `0–max`): bars run from 0 to the slowest
+  round trip shown. A steady host sits near the top with small ripples,
+  and a spike stands out by squashing everything else.
+- **`floored`**: bars run from the fastest round trip shown to the
+  slowest, so jitter uses the whole height. The range is never narrower
+  than a fifth of the slowest round trip, or 1ms, so a steady host's
+  noise stays small.
+- **`minmax`**: plain fastest to slowest, so any jitter at all fills
+  the height. Best for seeing its pattern, but a host varying by 0.4ms
+  looks the same as one varying by 300ms. Check the gutter.
 
 Hosts are always sorted, and fill the screen top to bottom before
 wrapping into another column, so a short list gets full-width sparklines.
@@ -981,10 +1000,13 @@ reads `+N more`, with how many of those are down.
 - **Red:** the last 3 probes were all lost, nothing has replied yet, or
   the name doesn't resolve.
 
-**Keys:** `r` resets every host's stats and sparkline, and `q` or Ctrl-C
-quits. On the way out the grid is cleared away, leaving a summary like
+**Keys:** `r` resets every host's stats and sparkline, `s` cycles the
+sparkline scale, and `q` or Ctrl-C quits. On the way out the grid is cleared away, leaving a summary like
 `ping`'s, one line per host. After an `r` it covers only the time since
-the reset, and says so. pew exits 1 if any host never replied, so
+the reset, and says so. It ends with a `Hosts Up:` line listing every
+host that replied, comma-separated with no spaces, so you can paste it
+straight into the next command (`pew run lo1,lo2,web3 -- uptime`). A
+refused TCP connection counts as up. pew exits 1 if any host never replied, so
 `pew ping web -c 3 -q && ...` works in scripts.
 
 **What gets pinged:** the address `ssh` itself would connect to. pew

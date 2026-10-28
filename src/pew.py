@@ -1877,6 +1877,14 @@ PING_FPS = 4
 PING_SYM = {"ok": "✔", "warn": "◐", "down": "✘", "wait": "◌"}
 PING_COLOR = {"ok": GREEN, "warn": AMBER, "down": RED, "wait": DIM}
 SPARK_BLOCKS = " ▁▂▃▄▅▆▇█"
+# Sparkline vertical scales, cycled with `s`: 0 to the slowest round trip
+# shown; fastest to slowest, but never a range narrower than a fifth of the
+# slowest (or 1ms), so a steady host's noise stays small; or plain fastest
+# to slowest, where any jitter fills the height.
+PING_SCALES = {"zero": "0–max", "floored": "floored", "minmax": "min–max"}
+PING_FLOOR_FRACTION = 0.2
+PING_FLOOR_MIN = 0.001
+PING_GUTTER = 6         # sparkline axis labels: "3.4ms" plus the slow tick
 
 
 class PingTarget:
@@ -1966,6 +1974,28 @@ def format_rtt(seconds):
     if ms < 10000:
         return f"{ms:.0f}ms"
     return f"{seconds:.1f}s"
+
+
+def axis_label(seconds):
+    """A round trip in at most 5 columns, for the sparkline gutter."""
+    ms = seconds * 1000
+    if round(ms, 1) < 10:
+        return f"{ms:.1f}ms"
+    if round(ms) < 1000:
+        return f"{ms:.0f}ms"
+    return f"{seconds:.1f}s" if round(seconds, 1) < 100 else f"{seconds:.0f}s"
+
+
+def spark_range(rtts, scale):
+    """(bottom, top) of a sparkline's vertical scale, in seconds."""
+    top = max(rtts)
+    if scale == "zero":
+        return 0.0, top
+    bottom = min(rtts)
+    if scale == "floored":
+        floor = max(top * PING_FLOOR_FRACTION, PING_FLOOR_MIN)
+        bottom = max(0.0, min(bottom, top - floor))
+    return bottom, top
 
 
 def ssh_config(host, opts):
@@ -2316,21 +2346,43 @@ class PingBoard:
         rtt = t.last[1] if t.last else None
         return sym + mid + [(f" {format_rtt(rtt):>7}", None)]
 
+    @staticmethod
+    def _gutter(width):
+        return PING_GUTTER if width >= PING_GUTTER + 10 else 0
+
     def _spark(self, t, width, rows):
-        """rows lines of sparkline for t's last width probes, newest at the
-        right edge; bars run 0 to the slowest round trip shown, in eighths
-        of a row. A lost probe is a red dot on the bottom line."""
+        """rows lines of sparkline for t's last probes, newest at the right
+        edge, in eighths of a row, after a gutter labelling the top and
+        bottom of the scale (opts.scale, see PING_SCALES) and ticking where
+        the slow threshold falls. A lost probe is a red dot on the bottom
+        line."""
         slow = self.opts.slow
+        gutter = self._gutter(width)
+        width -= gutter
         hist = list(t.history)[-width:]
-        scale = max((r for s, r in hist if s != "lost"), default=0) or 1e-6
+        rtts = [r for s, r in hist if s != "lost"]
+        bottom, top = spark_range(rtts, self.opts.scale) if rtts else (0.0, 0.0)
+        span = top - bottom or 1e-9
+        tick = None
+        if rows >= 2 and bottom < slow / 1000 < top:
+            tick = min(rows - 1, int((slow / 1000 - bottom) / span * rows))
         lines = []
         for row in range(rows - 1, -1, -1):
-            segs = [(" " * (width - len(hist)), None)]
+            segs = []
+            if gutter:
+                label = ""
+                if rtts and row == rows - 1:
+                    label = axis_label(top)
+                elif rtts and row == 0:
+                    label = "0" if self.opts.scale == "zero" else axis_label(bottom)
+                segs += [(f"{label:>{gutter - 1}}", DIM),
+                         ("┈" if row == tick else " ", AMBER)]
+            segs.append((" " * (width - len(hist)), None))
             for status, rtt in hist:
                 if status == "lost":
                     segs.append(("·" if row == 0 else " ", RED))
                     continue
-                level = max(1, round(rtt / scale * rows * 8)) - row * 8
+                level = max(1, round((rtt - bottom) / span * rows * 8)) - row * 8
                 ch = SPARK_BLOCKS[min(max(level, 0), 8)]
                 color = AMBER if status == "refused" or rtt * 1000 > slow else GREEN
                 if segs[-1][1] == color:
@@ -2379,6 +2431,10 @@ class PingBoard:
                 f"every {self.opts.interval:g}s · {format_elapsed(now - self.t0)}")
         if self.reset_at:
             head += f" · reset {format_elapsed(now - self.reset_at)} ago"
+        if lay["spark_rows"]:
+            span = (lay["tile_w"] - self._gutter(lay["tile_w"])) * self.opts.interval
+            span = f"{span:.0f}s" if span < 60 else format_elapsed(span)
+            head += f" · graph {span} · scale {PING_SCALES[self.opts.scale]}"
         counts = self._counts()
         cw = min(sum(len(s) for s, _ in counts), cols)
         lines = [self._line(self._fit([(head, None)], cols - cw) + counts, cols)]
@@ -2399,7 +2455,7 @@ class PingBoard:
         lines += [self._line(row, cols) for row in grid]
         lines += [self._line([], cols)] * (rows - 1 - len(lines))
 
-        keys = "q quit · r reset"
+        keys = "q quit · r reset · s scale"
         right = ""
         if self.skipped:
             names = Live._name_list(sorted(self.skipped, key=natural_key),
@@ -2437,6 +2493,9 @@ def ping_summary(targets, color, reset_at):
         rc = 0 if t.received else 1
         for name in t.names:
             out(paint(name, rc, color) + " " * (width - len(name)) + f": {text}")
+    # Comma-separated with no spaces, ready to paste as a HOST pattern.
+    up = sorted((n for t in targets if t.received for n in t.names), key=natural_key)
+    out(f"Hosts Up: {','.join(up) if up else '(none)'}")
 
 
 def determine_slow(opts):
@@ -2451,6 +2510,17 @@ def determine_slow(opts):
             warn(f"slow={value!r} in {PEWRC_PATH} isn't a number of ms, "
                  f"using {PING_DEFAULT_SLOW_MS:g}")
     return PING_DEFAULT_SLOW_MS
+
+
+def determine_scale(opts):
+    """--scale > ~/.pewrc [scale=] > zero (see PING_SCALES)."""
+    if opts.scale:
+        return opts.scale
+    value = load_pewrc().get("scale", "").lower()
+    if value and value not in PING_SCALES:
+        warn(f"unknown scale={value!r} in {PEWRC_PATH} "
+             f"(one of {', '.join(PING_SCALES)}), using zero")
+    return value if value in PING_SCALES else "zero"
 
 
 @contextlib.contextmanager
@@ -2487,6 +2557,7 @@ def do_ping(hosts, opts):
     if opts.interval <= 0:
         die("--interval must be more than 0")
     opts.slow = determine_slow(opts)
+    opts.scale = determine_scale(opts)
     timeout = opts.timeout if opts.timeout is not None else min(1.0, opts.interval)
     targets, skipped = ping_targets(hosts, opts)
     if not targets:
@@ -2578,6 +2649,10 @@ def do_ping(hosts, opts):
                             board.reset_at = time.monotonic()
                             reset_wall = time.time()
                             next_frame = 0
+                        if "s" in ch:
+                            names = list(PING_SCALES)
+                            opts.scale = names[(names.index(opts.scale) + 1) % len(names)]
+                            next_frame = 0
                     else:
                         key.data(key.fileobj)
         except KeyboardInterrupt:
@@ -2619,7 +2694,7 @@ def build_parser():
     inventory_parent.add_argument(
         "--pewrc", metavar="PATH",
         help="Use PATH instead of ~/.pewrc for inventory=/ansible_config=/"
-             "hosts_default=/timestamp_format=/extra_vars=/color=/pretty=/tty=/sort=/slow= "
+             "hosts_default=/timestamp_format=/extra_vars=/color=/pretty=/tty=/sort=/slow=/scale= "
              "overrides. "
              "Same as "
              "$PEW_PEWRC, which this takes precedence over.",
@@ -2887,6 +2962,14 @@ def build_parser():
         "--slow", type=float, default=None, metavar="MS",
         help="Round trip, in milliseconds, above which a host shows amber "
              f"(default: ~/.pewrc's slow=, else {PING_DEFAULT_SLOW_MS:g})",
+    )
+    ping_p.add_argument(
+        "--scale", choices=list(PING_SCALES), default=None,
+        help="Sparkline scale: zero (0 to the slowest round trip shown), "
+             "floored (fastest to slowest, but a range no narrower than a "
+             "fifth of the slowest, or 1ms) or minmax (fastest to slowest). "
+             "The s key cycles through them. Default from ~/.pewrc's scale=, "
+             "else zero.",
     )
     ping_p.add_argument(
         "--quiet", "-q", action="store_true",
