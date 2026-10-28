@@ -185,7 +185,7 @@ Pass `--pewrc PATH` (or set `$PEW_PEWRC`; `--pewrc` wins if both are
 set) to use a different rc file entirely — it replaces `~/.pewrc` for
 every setting on this page (`inventory=`, `ansible_config=`,
 `hosts_default=`, `timestamp_format=`, `extra_vars=`, `color=`, `pretty=`,
-`pretty_style=`, `tty=`, `sort=`). Useful for per-project config,
+`pretty_style=`, `tty=`, `sort=`, `slow=`). Useful for per-project config,
 or for testing.
 
 ### What about the rest of `ansible.cfg`?
@@ -936,6 +936,86 @@ against your local copy, and prints the result labeled by host, e.g.:
 Differences found is normal output, not a failure — `pew diff` only
 reports a host as failed if it couldn't actually fetch the file (e.g.
 permissions, file missing, host unreachable).
+
+### `pew ping` — watch every host respond, live
+
+`pew ping` pings every matched host in parallel and draws them as a grid
+of tiles that update as replies come in: green when the host is replying
+fine, amber when it's slow or dropping some, red when it's down.
+
+```sh
+pew ping web                 # ICMP echo, once a second, until q or Ctrl-C
+pew ping web --tcp           # TCP connect to each host's ssh port instead
+pew ping web -p 443          # TCP to port 443 on every host
+pew ping all -c 5 -q         # 5 probes each, then just the summary
+```
+
+```
+pew ping · icmp · 4 target(s) · every 1s · 3m12s                ✔ 2  ◐ 1  ✘ 1
+db1.example.com                                     ✘    192    100%     ----
+········································································
+web1.example.com, web1-alt.example.com              ✔    192      0%    3.1ms
+▁▁▂▁▁▁▃▁▁▁▁▂▁▁▁▁▂▂▁▁▁▃▁▁▁▁▂▁▁▁▁▂▁▁▁▃▁▁▁▁▂▁▁▁▁▂▂▁▁▁▃▁▁▁▁▂▁▁▁▁▂▁▁▁▃▁▁▁▁▂▁
+...
+q quit · r reset                                 skipped, proxied: bastion-db
+```
+
+Each tile shows the hostname, then the number of probes, the loss so
+far and the last round trip, and under that a sparkline of recent round
+trips, newest at the right. A lost probe is a red `·`. Bars run from 0
+to the slowest round trip on screen, so a spike stands out and the
+steady state sits near the top.
+
+Hosts are always sorted, and fill the screen top to bottom before
+wrapping into another column, so a short list gets full-width sparklines.
+Any spare height makes the sparklines taller. If the hosts don't all fit,
+the tiles drop their sparklines. If they still don't fit, the last tile
+reads `+N more`, with how many of those are down.
+
+**Colors:**
+- **Green:** replying, with no loss in the last 20 probes and the last
+  round trip under the slow threshold.
+- **Amber:** replying, but with some loss in the last 20 probes, or the
+  last round trip over the threshold (200ms, or `--slow MS`, or `slow=`
+  in `~/.pewrc`), or a refused TCP connection.
+- **Red:** the last 3 probes were all lost, nothing has replied yet, or
+  the name doesn't resolve.
+
+**Keys:** `r` resets every host's stats and sparkline, and `q` or Ctrl-C
+quits. On the way out the grid is cleared away, leaving a summary like
+`ping`'s, one line per host. After an `r` it covers only the time since
+the reset, and says so. pew exits 1 if any host never replied, so
+`pew ping web -c 3 -q && ...` works in scripts.
+
+**What gets pinged:** the address `ssh` itself would connect to. pew
+asks `ssh -G` for each host's effective config. That only parses config
+and never connects, and it takes in the inventory's rendered connection
+variables and your `~/.ssh/config`, so `Hostname` aliases are followed.
+A host reached through `ProxyJump` or `ProxyCommand` can't be pinged
+directly from here. It's skipped, and named in the footer and at the
+end. Hosts whose names resolve to the same address are pinged once and
+share a tile titled with all their names.
+
+**ICMP** uses unprivileged ICMP sockets, so it needs no root. They're on
+by default on most Linux distributions (`net.ipv4.ping_group_range`) and
+on macOS. If they're not allowed, pew falls back to running the system
+`ping` for each probe.
+
+**TCP** (`--tcp`, or `--port`/`-p PORT`, which implies it) times a
+connect to the host's ssh port (`ansible_port` or `~/.ssh/config`, else
+22), then resets the connection. A refused connection still means the
+host is up, so it counts as a reply. The tile turns amber with a
+**REFUSED** badge, and its sparkline bars turn amber too. Expect sshd to
+log each probe as a dropped connection.
+
+**Timing:** `--interval/-I` sets the time between probes to each host
+(default 1s). Probes are spread across the interval, not sent all at
+once. A probe with no reply after `--timeout/-O` (default 1s, or the
+interval if that's shorter) counts as lost.
+
+When stdout isn't a terminal there's no grid. pew prints a line per
+reply instead, like `web1: seq=3 time=2.1ms`, then the summary. `-q`
+prints only the summary. `--no-color` or `$NO_COLOR` turns the colors off.
 
 ### `pew shell` — interactive ssh to exactly one host
 

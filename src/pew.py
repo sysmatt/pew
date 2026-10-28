@@ -14,14 +14,19 @@ import concurrent.futures
 import contextlib
 import datetime
 import difflib
+import errno
 import grp
 import json
+import math
 import os
 import pwd
 import queue
 import re
+import selectors
 import shlex
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -44,7 +49,7 @@ ALIAS_DEFAULTS = {"pez": {"color", "pretty", "tty"}}
 # Subcommands whose first positional is HOST unless --hosts/-l is given
 # (`pew run web uptime`). `-` as HOST means ~/.pewrc's hosts_default=.
 # shell has its own HOST positional and isn't listed.
-HOST_POSITIONAL = ("run", "copy", "diff", "list", "facts")
+HOST_POSITIONAL = ("run", "copy", "diff", "list", "facts", "ping")
 HOST_EPILOG = ("HOST is an Ansible host pattern, the same as --hosts. It's "
                "the first positional unless --hosts/-l is given; use - for "
                "~/.pewrc's hosts_default=.")
@@ -1855,6 +1860,738 @@ def do_shell(host, command, opts):
 
 
 # ---------------------------------------------------------------------------
+# ping
+# ---------------------------------------------------------------------------
+
+AMBER = "\033[33m"
+REVERSE = "\033[7m"
+
+PING_DEFAULT_SLOW_MS = 200.0
+PING_WINDOW = 20        # recent probes judged for amber (loss)
+PING_RED_AFTER = 3      # consecutive losses that turn a tile red
+PING_HISTORY = 1000     # probes kept: enough to fill any terminal's width
+PING_TILE_MIN_WIDTH = 23   # PingBoard.STATS_W: the stats always fit
+PING_TILE_GAP = 2       # columns between side-by-side tiles
+PING_SPARK_MAX_ROWS = 12
+PING_FPS = 4
+PING_SYM = {"ok": "✔", "warn": "◐", "down": "✘", "wait": "◌"}
+PING_COLOR = {"ok": GREEN, "warn": AMBER, "down": RED, "wait": DIM}
+SPARK_BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+class PingTarget:
+    """One probed address (or address and port, for --tcp), standing for
+    every inventory name that resolves to it. Stats are kept since the
+    start or the last `r` reset; epoch tells a probe sent before a reset
+    from one sent after, so a late reply can't land in fresh stats."""
+
+    def __init__(self, names, hostname, port, family=None, sockaddr=None, error=None):
+        self.names = names
+        self.hostname = hostname
+        self.port = port
+        self.family = family
+        self.sockaddr = sockaddr
+        self.error = error
+        self.seq = 0
+        self.epoch = 0
+        self.reset()
+
+    def reset(self):
+        self.epoch += 1
+        self.done = self.received = self.refused = 0
+        self.rtt_min = self.rtt_max = None
+        self.rtt_sum = 0.0
+        self.last = None
+        self.history = collections.deque(maxlen=PING_HISTORY)
+
+    @property
+    def address(self):
+        return self.sockaddr[0] if self.sockaddr else None
+
+    def record(self, status, rtt):
+        """status is ok, refused (TCP RST: up, port closed) or lost."""
+        self.done += 1
+        if status != "lost":
+            self.received += 1
+            self.rtt_sum += rtt
+            self.rtt_min = rtt if self.rtt_min is None else min(self.rtt_min, rtt)
+            self.rtt_max = rtt if self.rtt_max is None else max(self.rtt_max, rtt)
+            if status == "refused":
+                self.refused += 1
+        self.last = (status, rtt)
+        self.history.append((status, rtt))
+
+    @property
+    def loss(self):
+        return 100.0 * (self.done - self.received) / self.done if self.done else 0.0
+
+    def state(self, slow):
+        if self.error:
+            return "down"
+        if not self.done:
+            return "wait"
+        recent = list(self.history)[-PING_WINDOW:]
+        if self.received == 0 or (len(recent) >= PING_RED_AFTER and all(
+                s == "lost" for s, _ in recent[-PING_RED_AFTER:])):
+            return "down"
+        status, rtt = self.last
+        if (status != "ok" or rtt * 1000 > slow
+                or any(s == "lost" for s, _ in recent)):
+            return "warn"
+        return "ok"
+
+    def short_title_width(self):
+        """Width of the shortest title that still shows every name or a
+        `+N`, which is what a one-line tile needs to fit."""
+        full = len(", ".join(self.names))
+        return min(full, len(self.names[0]) + len(f" +{len(self.names) - 1}")) \
+            if len(self.names) > 1 else full
+
+    def title(self, width=None):
+        """`web1, web1-alt`, or `web1 +1` and then a … cut to fit width."""
+        title = ", ".join(self.names)
+        if width is None or len(title) <= width:
+            return title
+        if len(self.names) > 1:
+            title = f"{self.names[0]} +{len(self.names) - 1}"
+        return title if len(title) <= width else title[:max(width - 1, 0)] + "…"
+
+
+def format_rtt(seconds):
+    if seconds is None:
+        return "----"
+    ms = seconds * 1000
+    if ms < 100:
+        return f"{ms:.1f}ms"
+    if ms < 10000:
+        return f"{ms:.0f}ms"
+    return f"{seconds:.1f}s"
+
+
+def ssh_config(host, opts):
+    """ssh's effective config for host, from `ssh -G`: the inventory's
+    rendered connection options plus ~/.ssh/config, as ssh itself would
+    apply them. Parses config only, never connects. None if ssh fails."""
+    argv = ["ssh", "-G"] + ssh_options(host, opts) + [remote_spec(host, opts)]
+    debug_cmd(argv)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        die("ssh not found on PATH")
+    if proc.returncode != 0:
+        debug_block(f"ssh -G {host} stderr", proc.stderr)
+        return None
+    config = {}
+    for line in proc.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        config.setdefault(key.lower(), value)
+    return config
+
+
+def ping_resolve(host, opts):
+    """(hostname, port, proxy, family, sockaddr, error) for one host."""
+    config = ssh_config(host, opts)
+    if config is None:
+        warn(f"{host}: ssh -G failed, pinging its ansible_host as-is")
+        conn = host_connection(host, opts)
+        config = {"hostname": conn.get("address") or host,
+                  "port": conn.get("port") or "22"}
+    proxy = config.get("proxyjump") or config.get("proxycommand")
+    if proxy and proxy != "none":
+        return config["hostname"], None, proxy, None, None, None
+    port = opts.port or int(config.get("port") or 22) if opts.tcp else None
+    try:
+        family, _, _, _, sockaddr = socket.getaddrinfo(
+            config["hostname"], port or 0, proto=socket.IPPROTO_TCP)[0]
+    except (socket.gaierror, UnicodeError) as e:
+        debug(f"{host}: can't resolve {config['hostname']}: {e}")
+        return config["hostname"], port, None, None, None, "unresolved"
+    return config["hostname"], port, None, family, sockaddr, None
+
+
+def ping_targets(hosts, opts):
+    """Targets in host order (hosts sharing an address, and port for --tcp,
+    share one), plus {host: proxy} for the hosts skipped as proxied."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+        resolved = list(ex.map(lambda h: ping_resolve(h, opts), hosts))
+    targets = {}
+    skipped = {}
+    for host, (hostname, port, proxy, family, sockaddr, error) in zip(hosts, resolved):
+        if proxy:
+            skipped[host] = proxy
+            continue
+        key = (family, sockaddr[0], port) if sockaddr else ("error", host)
+        if key in targets:
+            targets[key].names.append(host)
+        else:
+            targets[key] = PingTarget([host], hostname, port, family, sockaddr, error)
+        debug(f"{host}: ping {hostname} -> {sockaddr or error}")
+    return list(targets.values()), skipped
+
+
+def icmp_checksum(data):
+    if len(data) % 2:
+        data += b"\0"
+    total = sum(int.from_bytes(data[i:i + 2], "big") for i in range(0, len(data), 2))
+    total = (total >> 16) + (total & 0xFFFF)
+    total += total >> 16
+    return ~total & 0xFFFF
+
+
+class IcmpProber:
+    """Echo requests over unprivileged ICMP datagram sockets (one per
+    address family, shared by every target): no root, no subprocesses.
+    Replies are matched on (address, sequence). Linux rewrites the echo id
+    to the socket's own, and only hands that socket its own replies;
+    elsewhere (macOS) the id is checked here instead."""
+
+    name = "icmp"
+
+    def __init__(self, sel, report):
+        self.sel = sel
+        self.report = report
+        self.socks = {}
+        self.inflight = {}  # (address, seq) -> (target, epoch, sent, deadline)
+        self.ident = os.getpid() & 0xFFFF
+
+    @staticmethod
+    def available():
+        try:
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP).close()
+            return True
+        except OSError:
+            return False
+
+    def _sock(self, family):
+        if family not in self.socks:
+            proto = socket.IPPROTO_ICMPV6 if family == socket.AF_INET6 else socket.IPPROTO_ICMP
+            s = socket.socket(family, socket.SOCK_DGRAM, proto)
+            s.setblocking(False)
+            self.sel.register(s, selectors.EVENT_READ, self._on_read)
+            self.socks[family] = s
+        return self.socks[family]
+
+    def send(self, target, seq, timeout):
+        v6 = target.family == socket.AF_INET6
+        seq &= 0xFFFF
+        payload = b"pew-ping" + struct.pack("!d", time.time())
+        header = struct.pack("!BBHHH", 128 if v6 else 8, 0, 0, self.ident, seq)
+        # The kernel fills in the ICMPv6 checksum (it covers a pseudo-header).
+        checksum = 0 if v6 else icmp_checksum(header + payload)
+        packet = struct.pack("!BBHHH", 128 if v6 else 8, 0, checksum, self.ident, seq) + payload
+        sent = time.monotonic()
+        try:
+            self._sock(target.family).sendto(packet, target.sockaddr)
+        except OSError as e:
+            debug(f"{target.names[0]}: ping send failed: {e}")
+            self.report(target, target.epoch, seq, "lost", None)
+            return
+        self.inflight[(target.address, seq)] = (target, target.epoch, sent, sent + timeout)
+
+    def _on_read(self, sock):
+        while True:
+            try:
+                data, addr = sock.recvfrom(2048)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                continue
+            now = time.monotonic()
+            v6 = sock.family == socket.AF_INET6
+            if not v6 and data and data[0] >> 4 == 4:  # macOS includes the IP header
+                data = data[(data[0] & 0x0F) * 4:]
+            if len(data) < 8:
+                continue
+            kind, _, _, ident, seq = struct.unpack("!BBHHH", data[:8])
+            if kind != (129 if v6 else 0):
+                continue
+            if not sys.platform.startswith("linux") and ident != self.ident:
+                continue
+            entry = self.inflight.pop((addr[0], seq), None)
+            if entry:
+                target, epoch, sent, _ = entry
+                self.report(target, epoch, seq, "ok", now - sent)
+
+    def expire(self, now):
+        for key in [k for k, v in self.inflight.items() if v[3] <= now]:
+            target, epoch, _, _ = self.inflight.pop(key)
+            self.report(target, epoch, key[1], "lost", None)
+
+    def busy(self):
+        return bool(self.inflight)
+
+    def poll_interval(self):
+        return None
+
+
+class SystemPingProber:
+    """Fallback when this system doesn't allow unprivileged ICMP sockets:
+    one `ping -c 1` per probe, timed by its own `time=` output. -W is
+    seconds for iputils/busybox and milliseconds on macOS/BSD."""
+
+    name = "icmp (system ping)"
+    TIME_RE = re.compile(r"time[=<]\s*([\d.]+)\s*ms")
+
+    def __init__(self, sel, report):
+        self.report = report
+        self.inflight = []  # (proc, target, epoch, seq, deadline)
+
+    def send(self, target, seq, timeout):
+        if sys.platform.startswith("linux"):
+            wait = str(max(1, math.ceil(timeout)))
+        else:
+            wait = str(max(1, int(timeout * 1000)))
+        argv = ["ping", "-n", "-c", "1", "-W", wait, target.address]
+        try:
+            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, text=True)
+        except FileNotFoundError:
+            die("unprivileged ICMP sockets aren't allowed here and there's no "
+                "ping on PATH; try --tcp")
+        self.inflight.append((proc, target, target.epoch, seq,
+                              time.monotonic() + timeout + 1))
+
+    def expire(self, now):
+        still = []
+        for proc, target, epoch, seq, deadline in self.inflight:
+            if proc.poll() is None and now < deadline:
+                still.append((proc, target, epoch, seq, deadline))
+                continue
+            if proc.returncode is None:
+                proc.kill()
+            output = proc.communicate()[0] or ""
+            m = self.TIME_RE.search(output)
+            if proc.returncode == 0 and m:
+                self.report(target, epoch, seq, "ok", float(m.group(1)) / 1000)
+            else:
+                self.report(target, epoch, seq, "lost", None)
+        self.inflight = still
+
+    def busy(self):
+        return bool(self.inflight)
+
+    def poll_interval(self):
+        return 0.02 if self.inflight else None
+
+
+class TcpProber:
+    """A non-blocking connect() per probe, timed to the SYN-ACK and closed
+    straight away with a RST (SO_LINGER 0) so nothing sits in TIME_WAIT.
+    A refused connection is a reply too: the host is up, the port closed."""
+
+    name = "tcp"
+
+    def __init__(self, sel, report):
+        self.sel = sel
+        self.report = report
+        self.inflight = {}  # socket -> (target, epoch, seq, sent, deadline)
+
+    def send(self, target, seq, timeout):
+        s = socket.socket(target.family, socket.SOCK_STREAM)
+        s.setblocking(False)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sent = time.monotonic()
+        rc = s.connect_ex(target.sockaddr)
+        if rc in (errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EAGAIN):
+            self.inflight[s] = (target, target.epoch, seq, sent, sent + timeout)
+            self.sel.register(s, selectors.EVENT_WRITE, self._on_write)
+        else:
+            self._finish(s, target, target.epoch, seq, sent, rc)
+
+    def _finish(self, s, target, epoch, seq, sent, rc):
+        rtt = time.monotonic() - sent
+        s.close()
+        if rc == 0:
+            self.report(target, epoch, seq, "ok", rtt)
+        elif rc == errno.ECONNREFUSED:
+            self.report(target, epoch, seq, "refused", rtt)
+        else:
+            debug(f"{target.names[0]}: tcp probe: {os.strerror(rc)}")
+            self.report(target, epoch, seq, "lost", None)
+
+    def _on_write(self, s):
+        target, epoch, seq, sent, _ = self.inflight.pop(s)
+        self.sel.unregister(s)
+        self._finish(s, target, epoch, seq, sent,
+                     s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR))
+
+    def expire(self, now):
+        for s in [s for s, v in self.inflight.items() if v[4] <= now]:
+            target, epoch, seq, _, _ = self.inflight.pop(s)
+            self.sel.unregister(s)
+            s.close()
+            self.report(target, epoch, seq, "lost", None)
+
+    def busy(self):
+        return bool(self.inflight)
+
+    def poll_interval(self):
+        return None
+
+
+def ping_layout(n, cols, rows, one_line_width):
+    """Fit n tiles to a cols x rows screen (less the header and footer),
+    filling top to bottom first, then wrapping into more columns, so the
+    sparklines get as much width as possible; spare height goes to taller
+    sparklines. Shrinks the gap, then drops the sparkline, before giving
+    up on fitting them all. Returns a dict: columns, per_col, tile_w,
+    text_rows (1: name and stats on one line, 2: stacked), spark_rows,
+    gap, and shown (how many tiles fit; any more become a +N more tile)."""
+    avail = max(rows - 2, 1)
+    for gap, spark in ((1, 1), (0, 1), (0, 0)):
+        for c in range(1, n + 1):
+            tile_w = (cols + PING_TILE_GAP) // c - PING_TILE_GAP if c > 1 else cols
+            if c > 1 and tile_w < PING_TILE_MIN_WIDTH:
+                break
+            per_col = math.ceil(n / c)
+            text = 1 if tile_w >= one_line_width else 2
+            if per_col * (text + spark + gap) - gap <= avail:
+                if spark:
+                    spark = max(1, min(PING_SPARK_MAX_ROWS,
+                                       (avail + gap) // per_col - text - gap))
+                return dict(columns=c, per_col=per_col, tile_w=tile_w, text_rows=text,
+                            spark_rows=spark, gap=gap, shown=n)
+    c = max(1, (cols + PING_TILE_GAP) // (PING_TILE_MIN_WIDTH + PING_TILE_GAP))
+    tile_w = (cols + PING_TILE_GAP) // c - PING_TILE_GAP if c > 1 else cols
+    text = 1 if tile_w >= one_line_width else 2
+    per_col = max(1, avail // text)
+    return dict(columns=c, per_col=per_col, tile_w=tile_w, text_rows=text,
+                spark_rows=0, gap=0, shown=max(c * per_col - 1, 0))
+
+
+class PingBoard:
+    """The full-screen tile grid, on the terminal's alternate screen (so
+    the scrollback is left as it was) with the cursor hidden; both are
+    restored on the way out, before the summary is printed."""
+
+    STATS_W = 23  # "✔ 12345    100%  12.3ms"
+
+    def __init__(self, targets, skipped, prober, opts, color):
+        self.targets = targets
+        self.skipped = skipped
+        self.prober = prober
+        self.opts = opts
+        self.color = color
+        self.t0 = time.monotonic()
+        self.reset_at = None
+
+    def __enter__(self):
+        sys.stdout.write("\033[?1049h\033[?25l\033[H\033[2J")
+        sys.stdout.flush()
+        return self
+
+    def __exit__(self, *exc):
+        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.flush()
+        return False
+
+    def _paint(self, color, text):
+        return f"{color}{text}{RESET}" if self.color and color and text else text
+
+    @staticmethod
+    def _fit(segments, width):
+        """(text, color) segments cut and padded to exactly width columns."""
+        fitted, used = [], 0
+        for text, color in segments:
+            text = text[:max(width - used, 0)]
+            if text:
+                fitted.append((text, color))
+                used += len(text)
+        if used < width:
+            fitted.append((" " * (width - used), None))
+        return fitted
+
+    def _line(self, segments, width):
+        return "".join(self._paint(c, t) for t, c in self._fit(segments, width))
+
+    def _stats(self, t, state):
+        if t.error:
+            return [(t.error, RED)]
+        sym = [(PING_SYM[state], PING_COLOR[state]), (f" {t.done:>5}", None)]
+        if t.last and t.last[0] == "refused":
+            mid = [(" ", None), ("REFUSED", REVERSE + AMBER)]
+        else:
+            mid = [(f" {t.loss:>6.0f}%", None)]
+        rtt = t.last[1] if t.last else None
+        return sym + mid + [(f" {format_rtt(rtt):>7}", None)]
+
+    def _spark(self, t, width, rows):
+        """rows lines of sparkline for t's last width probes, newest at the
+        right edge; bars run 0 to the slowest round trip shown, in eighths
+        of a row. A lost probe is a red dot on the bottom line."""
+        slow = self.opts.slow
+        hist = list(t.history)[-width:]
+        scale = max((r for s, r in hist if s != "lost"), default=0) or 1e-6
+        lines = []
+        for row in range(rows - 1, -1, -1):
+            segs = [(" " * (width - len(hist)), None)]
+            for status, rtt in hist:
+                if status == "lost":
+                    segs.append(("·" if row == 0 else " ", RED))
+                    continue
+                level = max(1, round(rtt / scale * rows * 8)) - row * 8
+                ch = SPARK_BLOCKS[min(max(level, 0), 8)]
+                color = AMBER if status == "refused" or rtt * 1000 > slow else GREEN
+                if segs[-1][1] == color:
+                    segs[-1] = (segs[-1][0] + ch, color)
+                else:
+                    segs.append((ch, color))
+            lines.append(segs)
+        return lines
+
+    def _tile(self, t, lay):
+        """The tile's lines, as segment lists."""
+        state = t.state(self.opts.slow)
+        w = lay["tile_w"]
+        stats = self._stats(t, state)
+        if lay["text_rows"] == 1:
+            name = t.title(w - self.STATS_W - 1)
+            pad = w - len(name) - sum(len(s) for s, _ in stats)
+            lines = [[(name, PING_COLOR[state]), (" " * max(pad, 1), None)] + stats]
+        else:
+            indent = "  " if w >= self.STATS_W + 2 else ""
+            lines = [[(t.title(w), PING_COLOR[state])], [(indent, None)] + stats]
+        if lay["spark_rows"]:
+            lines += self._spark(t, w, lay["spark_rows"])
+        return lines + [[]] * lay["gap"]
+
+    def _counts(self):
+        counts = collections.Counter(t.state(self.opts.slow) for t in self.targets)
+        return [(f"{PING_SYM[k]} {counts[k]}  ", PING_COLOR[k])
+                for k in ("ok", "warn", "down") if counts[k]]
+
+    def render(self):
+        try:
+            cols, rows = os.get_terminal_size(sys.stdout.fileno())
+        except OSError:
+            cols, rows = 80, 24
+        cols, rows = max(cols or 80, 20), max(rows or 24, 5)
+        now = time.monotonic()
+        one_line = max(len(t.title(t.short_title_width())) for t in self.targets) + 1 + self.STATS_W
+        lay = ping_layout(len(self.targets), cols, rows, one_line)
+
+        mode = self.prober.name
+        ports = {t.port for t in self.targets if t.port}
+        if len(ports) == 1:
+            mode += f"/{ports.pop()}"
+        head = (f"{PROG} ping · {mode} · {len(self.targets)} target(s) · "
+                f"every {self.opts.interval:g}s · {format_elapsed(now - self.t0)}")
+        if self.reset_at:
+            head += f" · reset {format_elapsed(now - self.reset_at)} ago"
+        counts = self._counts()
+        cw = min(sum(len(s) for s, _ in counts), cols)
+        lines = [self._line(self._fit([(head, None)], cols - cw) + counts, cols)]
+
+        shown = self.targets[:lay["shown"]]
+        tile_h = lay["text_rows"] + lay["spark_rows"] + lay["gap"]
+        grid = [[] for _ in range(min(lay["per_col"] * tile_h, rows - 2))]
+        for c in range(lay["columns"]):
+            col = shown[c * lay["per_col"]:(c + 1) * lay["per_col"]]
+            tiles = [self._tile(t, lay) for t in col]
+            if c == lay["columns"] - 1 and lay["shown"] < len(self.targets):
+                tiles.append(self._more(lay["shown"]))
+            col_lines = [ln for tile in tiles for ln in tile]
+            for i, row in enumerate(grid):
+                if c:
+                    row.append((" " * PING_TILE_GAP, None))
+                row += self._fit(col_lines[i] if i < len(col_lines) else [], lay["tile_w"])
+        lines += [self._line(row, cols) for row in grid]
+        lines += [self._line([], cols)] * (rows - 1 - len(lines))
+
+        keys = "q quit · r reset"
+        right = ""
+        if self.skipped:
+            names = Live._name_list(sorted(self.skipped, key=natural_key),
+                                    max(cols - len(keys) - 22, 10))
+            right = f"skipped, proxied: {names}"
+        lines.append(self._line(self._fit([(keys, DIM)], max(cols - len(right), 0))
+                                + [(right, DIM)], cols))
+        sys.stdout.write("\033[H" + "\n".join(lines))
+        sys.stdout.flush()
+
+    def _more(self, shown):
+        rest = self.targets[shown:]
+        down = sum(t.state(self.opts.slow) == "down" for t in rest)
+        text = f"+{len(rest)} more" + (f" ({down} down)" if down else "")
+        return [[(text, RED if down else DIM)]]
+
+
+def ping_summary(targets, color, reset_at):
+    """ping's own end-of-run summary, one line per inventory name."""
+    if reset_at:
+        clock = datetime.datetime.fromtimestamp(reset_at).strftime("%H:%M:%S")
+        out(f"stats since reset at {clock}")
+    width = label_width([n for t in targets for n in t.names])
+    for t in targets:
+        if t.error:
+            text = f"{t.hostname} {t.error}"
+        else:
+            text = (f"{t.done} sent, {t.received} received, {t.loss:.0f}% loss")
+            if t.received:
+                avg = t.rtt_sum / t.received
+                text += (", rtt min/avg/max " + "/".join(
+                    f"{x * 1000:.1f}" for x in (t.rtt_min, avg, t.rtt_max)) + "ms")
+            if t.refused:
+                text += f" (port {t.port} refused)"
+        rc = 0 if t.received else 1
+        for name in t.names:
+            out(paint(name, rc, color) + " " * (width - len(name)) + f": {text}")
+
+
+def determine_slow(opts):
+    """--slow > ~/.pewrc [slow=] > PING_DEFAULT_SLOW_MS, in milliseconds."""
+    if opts.slow is not None:
+        return opts.slow
+    value = load_pewrc().get("slow")
+    if value:
+        try:
+            return float(value)
+        except ValueError:
+            warn(f"slow={value!r} in {PEWRC_PATH} isn't a number of ms, "
+                 f"using {PING_DEFAULT_SLOW_MS:g}")
+    return PING_DEFAULT_SLOW_MS
+
+
+@contextlib.contextmanager
+def cbreak_stdin():
+    """Single keypresses from stdin, unechoed, if it's a terminal; yields
+    its fd, or None. Ctrl-C still raises KeyboardInterrupt."""
+    if not sys.stdin.isatty():
+        yield None
+        return
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        yield fd
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def raise_fd_limit(needed):
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft != resource.RLIM_INFINITY and soft < needed:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (min(needed, hard), hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
+def do_ping(hosts, opts):
+    hosts = sorted(hosts, key=natural_key)
+    opts.tcp = opts.tcp or opts.port is not None
+    if opts.interval <= 0:
+        die("--interval must be more than 0")
+    opts.slow = determine_slow(opts)
+    timeout = opts.timeout if opts.timeout is not None else min(1.0, opts.interval)
+    targets, skipped = ping_targets(hosts, opts)
+    if not targets:
+        die(f"nothing to ping: all {len(skipped)} host(s) are reached through a proxy")
+    board_mode = sys.stdout.isatty() and not opts.quiet
+    color = (opts.color is not False and "NO_COLOR" not in os.environ
+             and sys.stdout.isatty())
+
+    def warn_skipped():
+        if skipped:
+            listed = ", ".join(f"{h} (via {p})" for h, p in
+                               sorted(skipped.items(), key=lambda kv: natural_key(kv[0])))
+            warn(f"skipped {len(skipped)} proxied host(s): {listed}")
+
+    label_w = max(len(t.title()) for t in targets)
+
+    def report(target, epoch, seq, status, rtt):
+        if epoch != target.epoch:
+            return
+        target.record(status, rtt)
+        if not board_mode and not opts.quiet:
+            what = {"ok": f"time={format_rtt(rtt)}",
+                    "refused": f"refused time={format_rtt(rtt)}",
+                    "lost": "timeout"}[status]
+            out(f"{target.title():<{label_w}}: seq={seq + 1} {what}")
+            sys.stdout.flush()
+
+    sel = selectors.DefaultSelector()
+    if opts.tcp:
+        prober = TcpProber(sel, report)
+    elif IcmpProber.available():
+        prober = IcmpProber(sel, report)
+    else:
+        info("unprivileged ICMP sockets not allowed, falling back to system ping")
+        prober = SystemPingProber(sel, report)
+    raise_fd_limit(len(targets) * (math.ceil(timeout / opts.interval) + 1) + 64)
+
+    live = [t for t in targets if not t.error]
+    start = time.monotonic()
+    due = {id(t): start + i * opts.interval / len(live) for i, t in enumerate(live)}
+    if not board_mode:
+        warn_skipped()
+        for t in targets:
+            if t.error:
+                out(f"{t.title():<{label_w}}: {t.hostname} {t.error}")
+
+    board = PingBoard(targets, skipped, prober, opts, color) if board_mode else None
+    reset_wall = None
+    with contextlib.ExitStack() as stack:
+        if board:
+            stack.enter_context(board)
+        keys_fd = stack.enter_context(cbreak_stdin()) if board else None
+        if keys_fd is not None:
+            sel.register(keys_fd, selectors.EVENT_READ, None)
+        next_frame = start
+        try:
+            while True:
+                now = time.monotonic()
+                for t in live:
+                    if opts.count is not None and t.seq >= opts.count:
+                        continue
+                    if due[id(t)] <= now:
+                        prober.send(t, t.seq, timeout)
+                        t.seq += 1
+                        due[id(t)] = max(due[id(t)] + opts.interval, now)
+                prober.expire(time.monotonic())
+                finished = (opts.count is not None and not prober.busy()
+                            and all(t.seq >= opts.count for t in live))
+                if board and (now >= next_frame or finished):
+                    board.render()
+                    next_frame = now + 1 / PING_FPS
+                if finished:
+                    break
+                wake = [due[id(t)] for t in live
+                        if opts.count is None or t.seq < opts.count]
+                if board:
+                    wake.append(next_frame)
+                if prober.busy():
+                    wake.append(now + (prober.poll_interval() or 0.25))
+                timeout_s = max(0.0, min(wake) - time.monotonic()) if wake else 0.25
+                for key, _ in sel.select(timeout_s):
+                    if key.data is None:
+                        ch = os.read(keys_fd, 32).decode(errors="ignore").lower()
+                        if "q" in ch:
+                            raise KeyboardInterrupt
+                        if "r" in ch:
+                            for t in targets:
+                                t.reset()
+                            board.reset_at = time.monotonic()
+                            reset_wall = time.time()
+                            next_frame = 0
+                    else:
+                        key.data(key.fileobj)
+        except KeyboardInterrupt:
+            pass
+
+    if not board and not opts.quiet:
+        out()
+    ping_summary(targets, color, reset_wall)
+    if board:
+        warn_skipped()
+    return 0 if all(t.received for t in targets) else 1
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1882,7 +2619,7 @@ def build_parser():
     inventory_parent.add_argument(
         "--pewrc", metavar="PATH",
         help="Use PATH instead of ~/.pewrc for inventory=/ansible_config=/"
-             "hosts_default=/timestamp_format=/extra_vars=/color=/pretty=/tty=/sort= "
+             "hosts_default=/timestamp_format=/extra_vars=/color=/pretty=/tty=/sort=/slow= "
              "overrides. "
              "Same as "
              "$PEW_PEWRC, which this takes precedence over.",
@@ -2119,6 +2856,47 @@ def build_parser():
     )
     diff_p.add_argument("local_file", help="Local file to diff against each host")
 
+    ping_p = sub.add_parser("ping", parents=[filter_parent],
+                             usage="%(prog)s [options] [HOST]",
+                             epilog=HOST_EPILOG,
+                             help="Ping every host in parallel, on a live grid")
+    ping_p.add_argument(
+        "--tcp", action="store_true",
+        help="Probe with a TCP connect to each host's ssh port (ansible_port, "
+             "~/.ssh/config, else 22) instead of ICMP echo. A refused "
+             "connection counts as a reply: the host is up, the port closed.",
+    )
+    ping_p.add_argument(
+        "--port", "-p", type=int, metavar="PORT",
+        help="TCP port to probe on every host (implies --tcp)",
+    )
+    ping_p.add_argument(
+        "--interval", "-I", type=float, default=1.0, metavar="SECONDS",
+        help="Time between probes to each host (default: 1)",
+    )
+    ping_p.add_argument(
+        "--timeout", "-O", type=float, default=None, metavar="SECONDS",
+        help="How long to wait for a reply before counting a probe lost "
+             "(default: 1, or --interval if that's shorter)",
+    )
+    ping_p.add_argument(
+        "--count", "-c", type=int, default=None, metavar="N",
+        help="Stop after N probes per host (default: until q or Ctrl-C)",
+    )
+    ping_p.add_argument(
+        "--slow", type=float, default=None, metavar="MS",
+        help="Round trip, in milliseconds, above which a host shows amber "
+             f"(default: ~/.pewrc's slow=, else {PING_DEFAULT_SLOW_MS:g})",
+    )
+    ping_p.add_argument(
+        "--quiet", "-q", action="store_true",
+        help="No grid or per-probe lines, just the summary at the end",
+    )
+    ping_p.add_argument(
+        "--no-color", dest="color", action="store_false", default=None,
+        help="No color in the grid or summary ($NO_COLOR does the same)",
+    )
+
     sub.add_parser("list", parents=[filter_parent],
                     usage="%(prog)s [options] [HOST]",
                     epilog=HOST_EPILOG,
@@ -2319,6 +3097,9 @@ def main():
             return 1 if unreachable else 0
 
         opts.connections = resolve_connections(hosts, opts)
+
+        if opts.action == "ping":
+            return do_ping(hosts, opts)
 
         alias_defaults = ALIAS_DEFAULTS.get(prog_name, set())
         pretty = (opts.action in ("run", "copy")
