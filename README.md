@@ -59,8 +59,8 @@ sudo pipx install --global .
 ```
 
 pipx also installs three shortcuts, `pes` (= `pew shell`), `per`
-(= `pew run`) and `pez` (= `pew run -P -Z`, plus color and the live
-status footer) — see
+(= `pew run`) and `pez` (= `pew run -P -Z`, plus color, the live
+status footer and a remote tty) — see
 [Shortcuts](#shortcuts-pes-per-and-pez). With the symlink install, add
 them yourself:
 
@@ -185,7 +185,7 @@ Pass `--pewrc PATH` (or set `$PEW_PEWRC`; `--pewrc` wins if both are
 set) to use a different rc file entirely — it replaces `~/.pewrc` for
 every setting on this page (`inventory=`, `ansible_config=`,
 `hosts_default=`, `timestamp_format=`, `extra_vars=`, `color=`, `pretty=`,
-`pretty_style=`, `sort=`). Useful for per-project config,
+`pretty_style=`, `tty=`, `sort=`). Useful for per-project config,
 or for testing.
 
 ### What about the rest of `ansible.cfg`?
@@ -442,22 +442,24 @@ full names in scripts**; prefixes are for typing.
 
 Run under the name `pes`, pew acts as `pew shell`; under `per`, as
 `pew run`. Under `pez` it acts as `pew run --parallel --yes` with
-[`--color`](#--color--hostname-colored-by-exit-status) and
-[`--pretty`](#--pretty--live-status-while-it-runs) turned on.
+[`--color`](#--color--hostname-colored-by-exit-status),
+[`--pretty`](#--pretty--live-status-while-it-runs) and
+[`--tty`](#--tty--a-remote-terminal-so-tools-keep-their-color) turned on.
 Everything after is passed through unchanged:
 
 ```sh
 pes alpha                            # pew shell alpha
 pes alpha --root -- htop             # pew shell alpha --root -- htop
 per web uptime                       # pew run web uptime
-pez web uptime                       # pew run -P -Z -C --pretty web uptime
+pez web uptime                       # pew run -P -Z -C -T --pretty web uptime
 ```
 
-`pez` turns color and the footer on the same soft way `color=yes` and
-`pretty=yes` in `~/.pewrc` do, not as literal flags. So `pez web -f ...`
-and `pez web -q ...` still work (just without hostname color),
-`--no-color`, `--no-pretty` and `$NO_COLOR` turn them off, and piped
-output stays plain.
+`pez` turns color, the footer and the tty on the same soft way
+`color=yes`, `pretty=yes` and `tty=yes` in `~/.pewrc` do, not as literal
+flags. So `pez web -f ...` and `pez web -q ...` still work (just without
+hostname color), `--no-color`, `--no-pretty`, `--no-tty` and `$NO_COLOR`
+turn them off, and piped output stays plain. Use `--no-tty` for hosts
+without a POSIX shell, such as network gear.
 
 It's keyed on the name pew was invoked as, so it works the same for the
 pipx entry points and for a symlink to `./pew` (see **Install**).
@@ -731,6 +733,62 @@ turns it off for a single run, and so does setting `$NO_COLOR`. An
 explicit `--color` still wins over `$NO_COLOR`. The `~/.pewrc` default
 quietly does nothing on `--follow`/`--quiet` runs, so those keep working
 with no color.
+
+#### `--tty` — a remote terminal, so tools keep their color
+
+Over plain ssh, the remote command's output is a pipe, so most tools
+turn their color off. `--tty`/`-T` runs it on a pseudo-terminal instead
+(`ssh -tt`), so `ls`, `grep`, `git`, `systemctl` and friends color and
+format their output just as they would in an interactive session:
+
+```sh
+pew run web -T -- systemctl status nginx
+```
+
+The remote terminal is sized to fit pew's own: its width is pew's
+terminal width minus the prefix pew adds to every line (any timestamp,
+then the padded `host: ` label), so remote output doesn't wrap. With
+`--quiet` or `--multiline` there's no label, so it gets the full width.
+When pew's stdout isn't a terminal it uses `$COLUMNS`, or 200 if that's
+not set. It never goes below 40 columns, however long the hostnames.
+The width is set once when the run starts, so resizing the window
+mid-run doesn't change it.
+
+To make that work, pew starts the remote command with a short shell
+prefix (`--dry-run` shows it):
+
+```sh
+stty -onlcr cols N 2>/dev/null; export COLUMNS=N PAGER=cat GIT_PAGER=cat SYSTEMD_PAGER=cat;
+```
+
+which sets the size, stops the terminal turning each newline into
+CR-LF, and swaps pagers for `cat`. Without the last part, `git log` or
+`journalctl` would wait in `less` for a keypress that never comes. The
+prefix needs a POSIX shell on the remote end, so leave `--tty` off for
+hosts without one, such as network gear.
+
+Things that change on a tty:
+
+- **stdin** is `/dev/null`, so nothing can be piped into the remote
+  command. That also keeps ssh from switching your own terminal to raw
+  mode.
+- **Prompts wait for input.** Anything that asks for a password or a
+  `[Y/n]` will sit there until `--timeout` kills it.
+- **stderr** comes through the terminal, mixed in with stdout. pew
+  combines them anyway, so you see the same lines either way.
+- **ssh's own messages** are limited to errors (`-o LogLevel=ERROR`),
+  which drops the "Connection to ... closed." line ssh prints after a
+  tty session. A `LogLevel` in the host's `ansible_ssh_common_args` or
+  `ansible_ssh_extra_args` still takes precedence.
+
+Unlike `--color`, it works with `--follow` and `--quiet`, and output
+comes through line by line as well, which suits `--follow`.
+
+To have it on by default, put `tty=yes` in `~/.pewrc`. That default,
+like the one `pez` sets, only applies when stdout is a terminal, and
+`$NO_COLOR` turns it off. `--no-tty` turns it off for a single run. An
+explicit `--tty` always applies, even when you pipe the output, in which
+case the escape codes go into the pipe too.
 
 #### `--pretty` — live status while it runs
 

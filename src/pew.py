@@ -36,10 +36,10 @@ PROG = "pew"
 # `pes alpha` is `pew shell alpha`. Keyed on basename(argv[0]).
 PROG_ALIASES = {"pes": ["shell"], "per": ["run"], "pez": ["run", "-P", "-Z"]}
 
-# Aliases that also turn on --color/--pretty, softly: like ~/.pewrc's
-# color=yes/pretty=yes rather than a literal flag, so --follow/--quiet/
-# --no-color/--no-pretty still work.
-ALIAS_DEFAULTS = {"pez": {"color", "pretty"}}
+# Aliases that also turn on --color/--pretty/--tty, softly: like ~/.pewrc's
+# color=yes/pretty=yes/tty=yes rather than a literal flag, so --follow/
+# --quiet/--no-color/--no-pretty/--no-tty still work.
+ALIAS_DEFAULTS = {"pez": {"color", "pretty", "tty"}}
 
 # Subcommands whose first positional is HOST unless --hosts/-l is given
 # (`pew run web uptime`). `-` as HOST means ~/.pewrc's hosts_default=.
@@ -1233,6 +1233,70 @@ def ssh_argv(host, opts, munge_user=False):
 
 
 # ---------------------------------------------------------------------------
+# --tty: a remote pseudo-terminal, so tools color their output as if run
+# interactively
+# ---------------------------------------------------------------------------
+
+TTY_MIN_COLS = 40
+TTY_FALLBACK_COLS = 200
+
+
+def determine_tty(opts, default=False):
+    """--tty/--no-tty > $NO_COLOR > ~/.pewrc [tty=] or default (an
+    ALIAS_DEFAULTS name) > off. An explicit --tty always applies; a
+    default only when stdout is a terminal, so piped output stays plain."""
+    if opts.tty is not None:
+        return opts.tty
+    if "NO_COLOR" in os.environ:
+        return False
+    wanted = default or load_pewrc().get("tty", "").lower() in TRUTHY
+    return wanted and sys.stdout.isatty()
+
+
+def tty_cols(width, opts):
+    """Columns for the remote pty: pew's terminal width minus the prefix
+    pew puts on each line (timestamp, then `host: ` padded to width), so
+    remote output fits without wrapping. Off a terminal, $COLUMNS, then
+    TTY_FALLBACK_COLS. Never below TTY_MIN_COLS, however long the
+    hostnames."""
+    try:
+        cols = os.get_terminal_size(sys.stdout.fileno()).columns
+    except OSError:
+        env = os.environ.get("COLUMNS", "")
+        cols = int(env) if env.isdigit() else TTY_FALLBACK_COLS
+    cols -= len(timestamp_prefix(opts))
+    if not (opts.quiet or opts.multiline):
+        cols -= width + len(": ")
+    return max(cols, TTY_MIN_COLS)
+
+
+def tty_setup(cols):
+    """Remote shell prefix for a --tty run. ssh -tt with no local terminal
+    sends no window size, so set it; no CR before every LF; and plain cat
+    for pagers, which would otherwise wait on a keypress that never comes."""
+    return (f"stty -onlcr cols {cols} 2>/dev/null; "
+            f"export COLUMNS={cols} PAGER=cat GIT_PAGER=cat SYSTEMD_PAGER=cat;")
+
+
+def run_argv(host, args, opts):
+    """ssh argv for `run`. With --tty: -tt (forced, since pew's stdin isn't
+    a terminal) and LogLevel=ERROR, which drops the "Connection to ...
+    closed." line ssh prints after a pty session but keeps real errors.
+    Both go after the host's own options, so its ssh args can override."""
+    argv = ssh_argv(host, opts)
+    cols = getattr(opts, "tty_cols", None)
+    if cols:
+        argv = argv[:-1] + ["-tt", "-o", "LogLevel=ERROR", argv[-1], tty_setup(cols)]
+    return argv + substitute(args, host)
+
+
+def run_stdin(opts):
+    """No stdin under --tty: ssh -tt on pew's own terminal would put it in
+    raw mode, and parallel hosts would leave it that way."""
+    return subprocess.DEVNULL if getattr(opts, "tty_cols", None) else None
+
+
+# ---------------------------------------------------------------------------
 # run
 # ---------------------------------------------------------------------------
 
@@ -1241,12 +1305,12 @@ def substitute(args, host):
 
 
 def run_host(host, args, opts):
-    argv = ssh_argv(host, opts) + substitute(args, host)
+    argv = run_argv(host, args, opts)
     debug_cmd(argv)
     try:
         proc = subprocess.run(
-            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=opts.timeout,
+            argv, stdin=run_stdin(opts), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=opts.timeout,
         )
         return proc.returncode, proc.stdout, None
     except subprocess.TimeoutExpired:
@@ -1266,11 +1330,12 @@ def run_host_streaming(host, args, opts, on_line):
     pipe, which ends the `for line in proc.stdout` loop naturally even if
     the command was still silent (never having produced a line at all).
     """
-    argv = ssh_argv(host, opts) + substitute(args, host)
+    argv = run_argv(host, args, opts)
     debug_cmd(argv)
     try:
         proc = subprocess.Popen(
-            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            argv, stdin=run_stdin(opts), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True,
         )
     except FileNotFoundError:
         return 127, "ssh not found on PATH"
@@ -1430,11 +1495,13 @@ def emit(host, output, quiet, multiline, log_prefix, width=0, opts=None, rc=None
 
 
 def run_cmdline(host, args, opts):
-    return shlex.join(ssh_argv(host, opts) + substitute(args, host))
+    return shlex.join(run_argv(host, args, opts))
 
 
 def do_run(hosts, args, opts):
     width = label_width(hosts)
+    if opts.tty_on:
+        opts.tty_cols = tty_cols(width, opts)
 
     if opts.dry_run:
         for host in hosts:
@@ -1815,7 +1882,7 @@ def build_parser():
     inventory_parent.add_argument(
         "--pewrc", metavar="PATH",
         help="Use PATH instead of ~/.pewrc for inventory=/ansible_config=/"
-             "hosts_default=/timestamp_format=/extra_vars=/color=/pretty=/sort= "
+             "hosts_default=/timestamp_format=/extra_vars=/color=/pretty=/tty=/sort= "
              "overrides. "
              "Same as "
              "$PEW_PEWRC, which this takes precedence over.",
@@ -1991,6 +2058,20 @@ def build_parser():
     color_mode.add_argument(
         "--no-color", dest="color", action="store_false",
         help="Don't color output, overriding ~/.pewrc's color=",
+    )
+    tty_mode = run_p.add_mutually_exclusive_group()
+    tty_mode.add_argument(
+        "--tty", "-T", action="store_true", default=None,
+        help="Run the command on a remote pseudo-terminal (ssh -tt), so tools "
+             "color and format their output as they would interactively. Its "
+             "width is pew's terminal minus the host prefix, so lines don't "
+             "wrap; pagers are set to cat. Needs a POSIX shell on the remote "
+             "end. Default from ~/.pewrc's tty=yes (only when stdout is a "
+             "terminal); $NO_COLOR turns that default off.",
+    )
+    tty_mode.add_argument(
+        "--no-tty", dest="tty", action="store_false",
+        help="No remote pseudo-terminal, overriding ~/.pewrc's tty=",
     )
     run_p.add_argument(
         "command", nargs=argparse.REMAINDER,
@@ -2256,6 +2337,7 @@ def main():
                 color = determine_color(opts, "color" in alias_defaults or pretty)
                 opts.color_out = color
                 opts.color_err = color and sys.stderr.isatty()
+                opts.tty_on = determine_tty(opts, "tty" in alias_defaults)
                 if pretty:
                     live = LIVE = stack.enter_context(start_live(hosts, opts))
                 failures = do_run(hosts, command, opts)
